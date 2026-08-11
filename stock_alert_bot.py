@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
 """
-stock_alert_bot.py
-------------------
-Starter real-time stock-alert bot that posts to a Telegram channel.
+stock_alert_bot.py  (Finnhub edition)
+-------------------------------------
+Real-time stock-alert bot that posts to a Telegram channel.
 
-Covers four alert types out of the box:
-  1. Trading HALTS / resumes   -> Nasdaq Trader Trade-Halt RSS (free, official)
-  2. VOLUME SPIKES             -> Financial Modeling Prep (FMP) batch quotes vs avg volume
-  3. TOP MOVERS               -> FMP biggest-gainers / biggest-losers
-  4. BREAKING NEWS            -> FMP stock news for your watchlist
+Alert types:
+  1. Trading HALTS / resumes  -> Nasdaq Trader Trade-Halt RSS (free, official)
+  2. PRICE MOVERS / spikes     -> Finnhub /quote per watchlist symbol (free tier)
+  3. BREAKING NEWS            -> Finnhub /company-news per watchlist symbol (free tier)
 
-Design goals: dependency-light, single file, safe to run on a free host
-(Render / Railway / Fly.io / any $5 VPS). Runs one loop; each feed has its
-own interval so halts are checked far more often than news.
+Why Finnhub: the free tier (60 calls/min, no card) covers real-time quotes and
+company news, which is enough to run a watchlist scanner at no cost. NOTE: the
+free tier is licensed for personal / non-commercial use — upgrade to a paid
+Finnhub plan before charging members.
+
+True volume-surge detection needs candle data (paid) or the Finnhub trades
+WebSocket (free, 50 symbols). This build approximates "spikes" via large % moves;
+see the check_movers() note for where to add the WebSocket later.
 
 --------------------------------------------------------------------------
 QUICK START
 --------------------------------------------------------------------------
   pip install requests feedparser
-  export TELEGRAM_BOT_TOKEN="123456:ABC..."      # from @BotFather
-  export TELEGRAM_CHAT_ID="-1001234567890"        # your channel id
-  export FMP_API_KEY="your_fmp_key"               # financialmodelingprep.com
+  export TELEGRAM_BOT_TOKEN="123456:ABC..."     # from @BotFather
+  export TELEGRAM_CHAT_ID="-1001234567890"       # your channel id
+  export FINNHUB_API_KEY="your_finnhub_key"      # finnhub.io (free)
   python stock_alert_bot.py                        # live
   python stock_alert_bot.py --test                 # dry run: prints, never sends
 
-Tune the CONFIG block below (watchlist, thresholds, intervals).
-This is a scaffold to build on, not investment advice. See the build plan.
+On Railway these are set as service Variables (same names, no quotes).
 --------------------------------------------------------------------------
 """
 
@@ -42,32 +45,37 @@ try:
 except ImportError:
     feedparser = None
 
+
 # ----------------------------------------------------------------------
 # CONFIG
 # ----------------------------------------------------------------------
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-FMP_API_KEY        = os.getenv("FMP_API_KEY", "")
+def _env(*names):
+    """Return the first non-empty env var among names, trimmed of stray quotes."""
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            return v.strip().strip('"').strip("'")
+    return ""
 
-# Tickers to watch for volume spikes + news. Keep this focused for the
-# free tiers; expand as you upgrade your data plan.
+
+TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = _env("TELEGRAM_CHAT_ID")
+FINNHUB_API_KEY    = _env("FINNHUB_API_KEY")
+
+# Tickers to scan for price moves + news. Keep focused for the free 60/min limit.
 WATCHLIST = ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "SOFI", "MARA", "RIOT"]
 
 # Alert thresholds
-RVOL_THRESHOLD      = 3.0    # fire volume spike when today's volume >= 3x the 50-day avg
-MIN_PRICE           = 1.00   # ignore sub-$1 unless you specifically want them
-MIN_ABS_CHANGE_PCT  = 5.0    # only volume-spike alert if price also moved >= 5%
-MOVERS_MIN_CHANGE   = 10.0   # only post top movers up/down at least this %
+MOVERS_MIN_CHANGE = 5.0    # alert when a watchlist symbol moves >= this % (abs)
+MIN_PRICE         = 1.00   # ignore anything under this price
 
 # Poll intervals (seconds). Halts are the most time-sensitive.
-INTERVAL_HALTS   = 20
-INTERVAL_VOLUME  = 60
-INTERVAL_MOVERS  = 300
-INTERVAL_NEWS    = 180
+INTERVAL_HALTS  = 20
+INTERVAL_MOVERS = 60
+INTERVAL_NEWS   = 180
 
 NASDAQ_HALT_RSS = "http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
-FMP_BASE        = "https://financialmodelingprep.com/stable"
-EDGAR_UA        = "YourCompany StockAlerts contact@yourdomain.com"  # required by SEC if you add EDGAR
+FINNHUB_BASE    = "https://finnhub.io/api/v1"
 
 DRY_RUN = "--test" in sys.argv
 
@@ -81,7 +89,7 @@ _seen = set()
 # ----------------------------------------------------------------------
 # TELEGRAM
 # ----------------------------------------------------------------------
-def send_telegram(text: str) -> None:
+def send_telegram(text):
     """Send an HTML-formatted message to the configured Telegram channel."""
     if DRY_RUN:
         print("\n--- ALERT (dry run) ---\n" + text + "\n-----------------------")
@@ -89,7 +97,7 @@ def send_telegram(text: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured; skipping send.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "text": text,
@@ -104,7 +112,7 @@ def send_telegram(text: str) -> None:
         log.error("Telegram request failed: %s", e)
 
 
-def once(key: str) -> bool:
+def once(key):
     """Return True the first time a given event key is seen, False after."""
     if key in _seen:
         return False
@@ -113,22 +121,26 @@ def once(key: str) -> bool:
 
 
 # ----------------------------------------------------------------------
-# FMP HELPERS
+# FINNHUB HELPERS
 # ----------------------------------------------------------------------
-def fmp_get(path: str, params: dict | None = None):
-    if not FMP_API_KEY:
-        log.warning("FMP_API_KEY not set; skipping %s", path)
+def finnhub_get(path, params=None):
+    if not FINNHUB_API_KEY:
+        log.warning("FINNHUB_API_KEY not set; skipping %s", path)
         return None
     params = dict(params or {})
-    params["apikey"] = FMP_API_KEY
+    params["token"] = FINNHUB_API_KEY
     try:
-        r = requests.get(f"{FMP_BASE}/{path}", params=params, timeout=15)
+        r = requests.get(FINNHUB_BASE + "/" + path, params=params, timeout=15)
+        if r.status_code == 429:
+            log.warning("Finnhub rate limit hit on %s; backing off", path)
+            time.sleep(2)
+            return None
         if r.status_code != 200:
-            log.error("FMP %s -> %s: %s", path, r.status_code, r.text[:150])
+            log.error("Finnhub %s -> %s: %s", path, r.status_code, r.text[:150])
             return None
         return r.json()
     except (requests.RequestException, ValueError) as e:
-        log.error("FMP request failed (%s): %s", path, e)
+        log.error("Finnhub request failed (%s): %s", path, e)
         return None
 
 
@@ -141,7 +153,7 @@ def check_halts():
         return
     try:
         feed = feedparser.parse(NASDAQ_HALT_RSS)
-    except Exception as e:  # noqa: BLE001 - feedparser can raise various things
+    except Exception as e:  # noqa: BLE001
         log.error("Halt feed error: %s", e)
         return
     for entry in feed.entries:
@@ -150,89 +162,69 @@ def check_halts():
             continue
         title = html.escape(entry.get("title", "Trading halt"))
         summary = html.escape(entry.get("summary", ""))[:300]
-        send_telegram(f"🚨 <b>TRADING HALT</b>\n{title}\n{summary}")
+        send_telegram("\U0001F6A8 <b>TRADING HALT</b>\n" + title + "\n" + summary)
 
 
 # ----------------------------------------------------------------------
-# ALERT: VOLUME SPIKES  (FMP batch quotes)
-# ----------------------------------------------------------------------
-def check_volume():
-    if not WATCHLIST:
-        return
-    data = fmp_get("batch-quote", {"symbols": ",".join(WATCHLIST)})
-    if not isinstance(data, list):
-        return
-    for q in data:
-        try:
-            sym = q["symbol"]
-            price = float(q.get("price") or 0)
-            vol = float(q.get("volume") or 0)
-            avg = float(q.get("avgVolume") or 0)
-            chg = float(q.get("changePercentage") or q.get("changesPercentage") or 0)
-        except (KeyError, TypeError, ValueError):
-            continue
-        if price < MIN_PRICE or avg <= 0:
-            continue
-        rvol = vol / avg
-        if rvol >= RVOL_THRESHOLD and abs(chg) >= MIN_ABS_CHANGE_PCT:
-            # Only alert once per day per symbol (bucket key by date).
-            day = time.strftime("%Y%m%d")
-            if not once(f"vol:{sym}:{day}"):
-                continue
-            arrow = "📈" if chg >= 0 else "📉"
-            send_telegram(
-                f"🔥 <b>VOLUME SPIKE</b> {arrow}\n"
-                f"<b>{html.escape(sym)}</b>  ${price:,.2f}  ({chg:+.1f}%)\n"
-                f"Volume {vol:,.0f} = <b>{rvol:.1f}x</b> avg"
-            )
-
-
-# ----------------------------------------------------------------------
-# ALERT: TOP MOVERS  (FMP gainers / losers)
+# ALERT: PRICE MOVERS / SPIKES  (Finnhub /quote per watchlist symbol)
 # ----------------------------------------------------------------------
 def check_movers():
-    for path, label, emoji in (
-        ("biggest-gainers", "TOP GAINER", "📈"),
-        ("biggest-losers", "TOP LOSER", "📉"),
-    ):
-        data = fmp_get(path)
-        if not isinstance(data, list):
+    """
+    Free-tier scanner: pull a real-time quote for each watchlist symbol and
+    alert when the day's percent change crosses the threshold.
+
+    To upgrade to true VOLUME-SURGE detection later, subscribe to the Finnhub
+    trades WebSocket (wss://ws.finnhub.io?token=KEY), accumulate per-symbol
+    traded volume in a rolling window, and fire when it exceeds N x the average.
+    That needs the `websocket-client` package and a background thread.
+    """
+    for sym in WATCHLIST:
+        q = finnhub_get("quote", {"symbol": sym})
+        if not isinstance(q, dict):
             continue
-        for m in data[:15]:
-            try:
-                sym = m["symbol"]
-                price = float(m.get("price") or 0)
-                chg = float(m.get("changesPercentage") or m.get("changePercentage") or 0)
-            except (KeyError, TypeError, ValueError):
-                continue
-            if price < MIN_PRICE or abs(chg) < MOVERS_MIN_CHANGE:
-                continue
+        try:
+            price = float(q.get("c") or 0)      # current price
+            chg = float(q.get("dp") or 0)       # percent change
+        except (TypeError, ValueError):
+            continue
+        if price < MIN_PRICE:
+            continue
+        if abs(chg) >= MOVERS_MIN_CHANGE:
             day = time.strftime("%Y%m%d")
-            if not once(f"mover:{sym}:{day}"):
+            if not once("mover:" + sym + ":" + day):
                 continue
+            arrow = "\U0001F4C8" if chg >= 0 else "\U0001F4C9"
+            label = "TOP GAINER" if chg >= 0 else "TOP LOSER"
             send_telegram(
-                f"{emoji} <b>{label}</b>\n"
-                f"<b>{html.escape(sym)}</b>  ${price:,.2f}  ({chg:+.1f}%)"
+                "\U0001F525 <b>" + label + "</b> " + arrow + "\n"
+                + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
+                + "  (" + format(chg, "+.1f") + "%)"
             )
+        # tiny pause to stay well under 60 calls/min across the watchlist
+        time.sleep(0.3)
 
 
 # ----------------------------------------------------------------------
-# ALERT: BREAKING NEWS  (FMP stock news for watchlist)
+# ALERT: BREAKING NEWS  (Finnhub /company-news per watchlist symbol)
 # ----------------------------------------------------------------------
 def check_news():
-    if not WATCHLIST:
-        return
-    data = fmp_get("news/stock", {"symbols": ",".join(WATCHLIST), "limit": 20})
-    if not isinstance(data, list):
-        return
-    for n in data:
-        url = n.get("url") or ""
-        if not url or not once("news:" + url):
+    today = time.strftime("%Y-%m-%d")
+    for sym in WATCHLIST:
+        items = finnhub_get("company-news", {"symbol": sym, "from": today, "to": today})
+        if not isinstance(items, list):
             continue
-        sym = html.escape(str(n.get("symbol", "")))
-        title = html.escape(str(n.get("title", "")))
-        site = html.escape(str(n.get("site", n.get("publisher", ""))))
-        send_telegram(f"📰 <b>NEWS</b> {sym}\n{title}\n<i>{site}</i>\n{url}")
+        for n in items[:5]:
+            url = n.get("url") or ""
+            nid = str(n.get("id") or url)
+            if not nid or not once("news:" + nid):
+                continue
+            headline = html.escape(str(n.get("headline", "")))
+            source = html.escape(str(n.get("source", "")))
+            send_telegram(
+                "\U0001F4F0 <b>NEWS</b> " + html.escape(sym) + "\n"
+                + headline + "\n<i>" + source + "</i>\n" + url
+            )
+        time.sleep(0.3)
 
 
 # ----------------------------------------------------------------------
@@ -241,8 +233,7 @@ def check_news():
 def main():
     log.info("Starting alert bot (dry_run=%s). Watchlist: %s", DRY_RUN, ", ".join(WATCHLIST))
     if DRY_RUN:
-        # One pass of each check so you can see output immediately.
-        for fn in (check_halts, check_volume, check_movers, check_news):
+        for fn in (check_halts, check_movers, check_news):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
@@ -251,16 +242,15 @@ def main():
         return
 
     schedule = [
-        (check_halts,  INTERVAL_HALTS,  0.0),
-        (check_volume, INTERVAL_VOLUME, 0.0),
-        (check_movers, INTERVAL_MOVERS, 0.0),
-        (check_news,   INTERVAL_NEWS,   0.0),
+        (check_halts,  INTERVAL_HALTS),
+        (check_movers, INTERVAL_MOVERS),
+        (check_news,   INTERVAL_NEWS),
     ]
-    next_run = {fn.__name__: 0.0 for fn, _, _ in schedule}
+    next_run = {fn.__name__: 0.0 for fn, _ in schedule}
 
     while True:
         now = time.time()
-        for fn, interval, _ in schedule:
+        for fn, interval in schedule:
             if now >= next_run[fn.__name__]:
                 try:
                     fn()
