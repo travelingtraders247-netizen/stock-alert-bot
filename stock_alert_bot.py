@@ -99,6 +99,12 @@ log = logging.getLogger("alertbot")
 # De-dup memory so the same event isn't posted twice in a session.
 _seen = set()
 
+# Global send pacing so a startup backlog never trips Telegram's flood limit.
+_send_lock = threading.Lock()
+_last_send_ts = [0.0]
+MIN_SEND_GAP = 1.2      # minimum seconds between two Telegram messages
+_silent = False         # when True, sends are suppressed (used to prime de-dup)
+
 # Volume-surge shared state (written by the WS thread, read by the rollup).
 _vol_lock = threading.Lock()
 _vol_current = defaultdict(float)                       # symbol -> volume this bucket
@@ -109,7 +115,14 @@ _vol_history = defaultdict(lambda: deque(maxlen=VOL_HISTORY))  # symbol -> past 
 # TELEGRAM
 # ----------------------------------------------------------------------
 def send_telegram(text):
-    """Send an HTML-formatted message to the configured Telegram channel."""
+    """Send an HTML message to Telegram, paced so we never trip the flood limit.
+
+    All sends are serialized through _send_lock and spaced at least
+    MIN_SEND_GAP apart. A 429 (Too Many Requests) is honored by sleeping the
+    server-provided retry_after and retrying, so alerts queue instead of drop.
+    """
+    if _silent:
+        return
     if DRY_RUN:
         print("\n--- ALERT (dry run) ---\n" + text + "\n-----------------------")
         return
@@ -123,12 +136,29 @@ def send_telegram(text):
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
-    try:
-        r = requests.post(url, json=payload, timeout=15)
-        if r.status_code != 200:
-            log.error("Telegram error %s: %s", r.status_code, r.text[:200])
-    except requests.RequestException as e:
-        log.error("Telegram request failed: %s", e)
+    with _send_lock:
+        gap = time.time() - _last_send_ts[0]
+        if gap < MIN_SEND_GAP:
+            time.sleep(MIN_SEND_GAP - gap)
+        for _attempt in range(4):
+            try:
+                r = requests.post(url, json=payload, timeout=15)
+            except requests.RequestException as e:
+                log.error("Telegram request failed: %s", e)
+                break
+            if r.status_code == 429:
+                retry = 5
+                try:
+                    retry = int(r.json()["parameters"]["retry_after"])
+                except (ValueError, KeyError, TypeError):
+                    pass
+                log.warning("Telegram 429; sleeping %ss then retrying", retry)
+                time.sleep(retry + 1)
+                continue
+            if r.status_code != 200:
+                log.error("Telegram error %s: %s", r.status_code, r.text[:200])
+            break
+        _last_send_ts[0] = time.time()
 
 
 def once(key):
@@ -337,6 +367,20 @@ def main():
                 log.error("%s failed: %s", fn.__name__, e)
         log.info("Dry run complete.")
         return
+
+    # Prime de-dup silently so a redeploy doesn't re-blast the existing backlog
+    # (today's whole halt list + already-published news). Only NEW events after
+    # this point will alert -- the same "from now on" behavior as the Make feeds.
+    global _silent
+    _silent = True
+    for fn in (check_halts, check_news):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            log.error("prime %s failed: %s", fn.__name__, e)
+    _silent = False
+    log.info("Primed de-dup on %d existing items; only new events will alert now.",
+             len(_seen))
 
     # Start the volume-surge WebSocket in the background.
     t = threading.Thread(target=_ws_run, daemon=True)
