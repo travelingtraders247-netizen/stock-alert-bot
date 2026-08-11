@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """
-stock_alert_bot.py  (Finnhub edition + real-time volume surge)
---------------------------------------------------------------
-Real-time stock-alert bot that posts to a Telegram channel.
+stock_alert_bot.py  (small-cap momentum edition)
+------------------------------------------------
+Real-time stock-alert bot that posts to a Telegram channel, focused on
+SMALL-CAP / LOW-FLOAT / PENNY MOMENTUM names -- the stockmembers.com /
+symbolalerts.com style -- instead of a fixed large-cap watchlist.
+
+How it works:
+  * A market-wide SCANNER (discover_movers) pulls the whole US market once a
+    minute and keeps only small, cheap, fast-moving names (widest net:
+    ~$0.10-$20, up >= X%, with real volume). Those become a DYNAMIC watchlist.
+  * The dynamic watchlist then drives the real-time volume-surge WebSocket and
+    the breaking-news check, so every alert is about an actual runner.
 
 Alert types:
-  1. Trading HALTS / resumes  -> Nasdaq Trader Trade-Halt RSS (free, official)
-  2. VOLUME SURGE             -> Finnhub trades WebSocket (free, up to 50 symbols)
-  3. PRICE MOVERS / spikes     -> Finnhub /quote per watchlist symbol (free tier)
-  4. BREAKING NEWS            -> Finnhub /company-news per watchlist symbol (free tier)
+  1. SMALL-CAP RUNNER   -> market-wide scanner (Nasdaq screener, free)
+  2. TRADING HALT       -> Nasdaq Trader Trade-Halt RSS (free, official)
+  3. VOLUME SURGE       -> Finnhub trades WebSocket on the current runners (free)
+  4. BREAKING NEWS      -> Finnhub /company-news on the current runners (free)
 
-Everything here runs on Finnhub's FREE tier (60 REST calls/min + a trades
-WebSocket for up to 50 symbols) plus the free Nasdaq halt feed. NOTE: the free
-tier is licensed for personal / non-commercial use -- upgrade to a paid Finnhub
-plan before charging members.
+HYBRID DATA NOTE: discovery currently uses Nasdaq's free (unofficial) screener
+endpoint -- $0, but it can rate-limit or change without notice, and it has no
+true "float" figure (we approximate low float with shares-outstanding). To move
+to a robust real-time feed later, replace ONLY discover_movers() with a
+Polygon.io/Massive full-market snapshot call; everything downstream is unchanged.
 
 --------------------------------------------------------------------------
 QUICK START
@@ -67,29 +77,43 @@ TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = _env("TELEGRAM_CHAT_ID")
 FINNHUB_API_KEY    = _env("FINNHUB_API_KEY")
 
-# Tickers to scan. Finnhub's free WebSocket allows up to 50 symbols.
-WATCHLIST = ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "SOFI", "MARA", "RIOT"]
-
-# Price-mover thresholds (REST /quote)
-MOVERS_MIN_CHANGE = 5.0    # alert when a symbol moves >= this % (abs)
-MIN_PRICE         = 1.00   # ignore anything under this price
+# --- Small-cap scanner filters ("widest net": sub-$1 to ~$20) ---
+PRICE_MIN      = 0.10      # ignore essentially-dead sub-penny junk below this
+PRICE_MAX      = 20.00     # small-cap / penny ceiling
+MIN_PERCENT    = 10.0      # only names up at least this % on the day
+MIN_VOLUME     = 100000    # shares traded today (liquidity floor)
+MIN_DOLLAR_VOL = 250000    # price * volume floor (kills illiquid sub-$1 traps)
+TOP_N_ALERTS   = 15        # max NEW runner alerts per scan (paced sender caps rate)
+MAX_WATCH      = 45        # max symbols kept on the free Finnhub WS (cap is 50)
+LOWFLOAT_MAX_M = 50.0      # shares-out (millions) under which we tag "LOW FLOAT"
 
 # Volume-surge thresholds (WebSocket trades)
-VOL_BUCKET_SEC = 60        # size of each volume bucket (seconds)
-VOL_HISTORY    = 20        # how many past buckets form the baseline average
-VOL_MIN_SAMPLES = 5        # need this many baseline buckets before alerting
-VOL_SURGE_MULT = 3.0       # fire when a bucket's volume >= this x the baseline avg
-VOL_MIN_SHARES = 5000      # ignore tiny buckets to avoid noise on thin names
+VOL_BUCKET_SEC  = 60
+VOL_HISTORY     = 20
+VOL_MIN_SAMPLES = 5
+VOL_SURGE_MULT  = 3.0
+VOL_MIN_SHARES  = 5000
 
-# Poll intervals (seconds). Halts are the most time-sensitive.
+# Poll intervals (seconds).
+INTERVAL_SCAN    = 60
 INTERVAL_HALTS   = 20
-INTERVAL_MOVERS  = 60
 INTERVAL_NEWS    = 180
 INTERVAL_VOLROLL = VOL_BUCKET_SEC
 
 NASDAQ_HALT_RSS = "http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
-FINNHUB_BASE    = "https://finnhub.io/api/v1"
-FINNHUB_WS      = "wss://ws.finnhub.io?token="
+# Unofficial Nasdaq screener: whole US market in one call (symbol/price/%chg/vol/mcap).
+NASDAQ_SCREENER = ("https://api.nasdaq.com/api/screener/stocks"
+                   "?tableonly=true&limit=6000&offset=0&download=true")
+NASDAQ_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.nasdaq.com",
+    "Referer": "https://www.nasdaq.com/",
+}
+FINNHUB_BASE = "https://finnhub.io/api/v1"
+FINNHUB_WS   = "wss://ws.finnhub.io?token="
 
 DRY_RUN = "--test" in sys.argv
 
@@ -99,28 +123,32 @@ log = logging.getLogger("alertbot")
 # De-dup memory so the same event isn't posted twice in a session.
 _seen = set()
 
-# Global send pacing so a startup backlog never trips Telegram's flood limit.
+# Global send pacing so a burst never trips Telegram's flood limit.
 _send_lock = threading.Lock()
 _last_send_ts = [0.0]
-MIN_SEND_GAP = 1.2      # minimum seconds between two Telegram messages
-_silent = False         # when True, sends are suppressed (used to prime de-dup)
+MIN_SEND_GAP = 1.2
+_silent = False
+
+# Dynamic watchlist (the current small-cap runners) shared across threads.
+_watch_lock = threading.Lock()
+_watchlist = set()
+_profile_cache = {}   # symbol -> {"shares_out_m": float|None}
 
 # Volume-surge shared state (written by the WS thread, read by the rollup).
 _vol_lock = threading.Lock()
-_vol_current = defaultdict(float)                       # symbol -> volume this bucket
-_vol_history = defaultdict(lambda: deque(maxlen=VOL_HISTORY))  # symbol -> past buckets
+_vol_current = defaultdict(float)
+_vol_history = defaultdict(lambda: deque(maxlen=VOL_HISTORY))
+
+# Live WebSocket handle + what it's currently subscribed to (managed dynamically).
+_ws_app = [None]
+_ws_subscribed = set()
 
 
 # ----------------------------------------------------------------------
 # TELEGRAM
 # ----------------------------------------------------------------------
 def send_telegram(text):
-    """Send an HTML message to Telegram, paced so we never trip the flood limit.
-
-    All sends are serialized through _send_lock and spaced at least
-    MIN_SEND_GAP apart. A 429 (Too Many Requests) is honored by sleeping the
-    server-provided retry_after and retrying, so alerts queue instead of drop.
-    """
+    """Send an HTML message to Telegram, paced so we never trip the flood limit."""
     if _silent:
         return
     if DRY_RUN:
@@ -193,8 +221,148 @@ def finnhub_get(path, params=None):
         return None
 
 
+def shares_out_millions(sym):
+    """Best-effort shares-outstanding in millions (our free 'low float' proxy)."""
+    if sym in _profile_cache:
+        return _profile_cache[sym].get("shares_out_m")
+    val = None
+    prof = finnhub_get("stock/profile2", {"symbol": sym})
+    if isinstance(prof, dict):
+        try:
+            so = prof.get("shareOutstanding")
+            val = float(so) if so else None   # Finnhub returns this in millions
+        except (TypeError, ValueError):
+            val = None
+    _profile_cache[sym] = {"shares_out_m": val}
+    return val
+
+
 # ----------------------------------------------------------------------
-# ALERT: TRADING HALTS  (Nasdaq Trader RSS, free)
+# MARKET-WIDE DISCOVERY  (free Nasdaq screener)
+# ----------------------------------------------------------------------
+def _num(s):
+    """Parse '$1.23', '12.34%', '1,234,567', '--' -> float or None."""
+    if s is None:
+        return None
+    t = str(s).strip().replace("$", "").replace("%", "").replace(",", "")
+    if t in ("", "--", "N/A", "NA", "UNCH"):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        return None
+
+
+def discover_movers():
+    """
+    Pull the whole US market and return small-cap momentum candidates:
+    [{"symbol","price","pct","volume"}], already filtered and sorted by % desc.
+
+    HYBRID UPGRADE POINT: to switch to a paid real-time feed later, replace the
+    body of this function with a Polygon.io/Massive full-market snapshot call
+    that returns the same list of dicts. Nothing else needs to change.
+    """
+    try:
+        r = requests.get(NASDAQ_SCREENER, headers=NASDAQ_HEADERS, timeout=20)
+    except requests.RequestException as e:
+        log.error("Scanner fetch failed: %s", e)
+        return []
+    if r.status_code != 200:
+        log.error("Scanner HTTP %s (Nasdaq screener may be throttling)", r.status_code)
+        return []
+    try:
+        data = r.json().get("data") or {}
+    except ValueError:
+        log.error("Scanner returned non-JSON (%d bytes)", len(r.content))
+        return []
+    rows = data.get("rows")
+    if rows is None:
+        rows = (data.get("table") or {}).get("rows")
+    if not rows:
+        log.warning("Scanner returned no rows.")
+        return []
+
+    out = []
+    for row in rows:
+        sym = (row.get("symbol") or "").strip().upper()
+        price = _num(row.get("lastsale"))
+        pct = _num(row.get("pctchange"))
+        vol = _num(row.get("volume"))
+        if not sym or price is None or pct is None or vol is None:
+            continue
+        if "^" in sym or "/" in sym or "." in sym:   # skip warrants/units/odd tickers
+            continue
+        if price < PRICE_MIN or price > PRICE_MAX:
+            continue
+        if pct < MIN_PERCENT:
+            continue
+        if vol < MIN_VOLUME or (price * vol) < MIN_DOLLAR_VOL:
+            continue
+        out.append({"symbol": sym, "price": price, "pct": pct, "volume": vol})
+
+    out.sort(key=lambda d: d["pct"], reverse=True)
+    log.info("Scanner: %d rows -> %d small-cap movers matched", len(rows), len(out))
+    return out
+
+
+def _ws_sync(desired):
+    """Subscribe/unsubscribe the live WS so it tracks exactly `desired` symbols."""
+    ws = _ws_app[0]
+    if ws is None:
+        return
+    for sym in desired - _ws_subscribed:
+        try:
+            ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
+            _ws_subscribed.add(sym)
+        except Exception as e:  # noqa: BLE001
+            log.warning("WS subscribe %s failed: %s", sym, e)
+    for sym in _ws_subscribed - desired:
+        try:
+            ws.send(json.dumps({"type": "unsubscribe", "symbol": sym}))
+        except Exception as e:  # noqa: BLE001
+            log.warning("WS unsubscribe %s failed: %s", sym, e)
+    _ws_subscribed.intersection_update(desired)
+
+
+def scan_market():
+    """Find small-cap runners, alert new ones, and refresh the dynamic watchlist."""
+    movers = discover_movers()
+    if not movers:
+        return
+
+    top = movers[:MAX_WATCH]
+    desired = {m["symbol"] for m in top}
+
+    # Refresh the shared watchlist that news + volume-surge use.
+    with _watch_lock:
+        _watchlist.clear()
+        _watchlist.update(desired)
+    _ws_sync(desired)
+
+    day = time.strftime("%Y%m%d")
+    alerted = 0
+    for m in movers:
+        if alerted >= TOP_N_ALERTS:
+            break
+        sym = m["symbol"]
+        if not once("runner:" + sym + ":" + day):
+            continue
+        so = shares_out_millions(sym)
+        tag = ""
+        if so is not None and so <= LOWFLOAT_MAX_M:
+            tag = "  •  \U0001F53B LOW FLOAT ~" + format(so, ".1f") + "M shares"
+        arrow = "\U0001F680"  # rocket
+        send_telegram(
+            arrow + " <b>SMALL-CAP RUNNER</b>\n"
+            + "<b>" + html.escape(sym) + "</b>  $" + format(m["price"], ",.2f")
+            + "  (" + format(m["pct"], "+.1f") + "%)\n"
+            + "Vol: " + format(int(m["volume"]), ",") + tag
+        )
+        alerted += 1
+
+
+# ----------------------------------------------------------------------
+# ALERT: TRADING HALTS  (Nasdaq Trader RSS, free -- already market-wide)
 # ----------------------------------------------------------------------
 def check_halts():
     if feedparser is None:
@@ -215,44 +383,17 @@ def check_halts():
 
 
 # ----------------------------------------------------------------------
-# ALERT: PRICE MOVERS / SPIKES  (Finnhub /quote per watchlist symbol)
-# ----------------------------------------------------------------------
-def check_movers():
-    for sym in WATCHLIST:
-        q = finnhub_get("quote", {"symbol": sym})
-        if not isinstance(q, dict):
-            continue
-        try:
-            price = float(q.get("c") or 0)      # current price
-            chg = float(q.get("dp") or 0)       # percent change
-        except (TypeError, ValueError):
-            continue
-        if price < MIN_PRICE:
-            continue
-        if abs(chg) >= MOVERS_MIN_CHANGE:
-            day = time.strftime("%Y%m%d")
-            if not once("mover:" + sym + ":" + day):
-                continue
-            arrow = "\U0001F4C8" if chg >= 0 else "\U0001F4C9"
-            label = "TOP GAINER" if chg >= 0 else "TOP LOSER"
-            send_telegram(
-                "\U0001F525 <b>" + label + "</b> " + arrow + "\n"
-                + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
-                + "  (" + format(chg, "+.1f") + "%)"
-            )
-        time.sleep(0.3)  # stay under 60 calls/min across the watchlist
-
-
-# ----------------------------------------------------------------------
-# ALERT: BREAKING NEWS  (Finnhub /company-news per watchlist symbol)
+# ALERT: BREAKING NEWS  (Finnhub /company-news on the current runners)
 # ----------------------------------------------------------------------
 def check_news():
+    with _watch_lock:
+        syms = sorted(_watchlist)
     today = time.strftime("%Y-%m-%d")
-    for sym in WATCHLIST:
+    for sym in syms:
         items = finnhub_get("company-news", {"symbol": sym, "from": today, "to": today})
         if not isinstance(items, list):
             continue
-        for n in items[:5]:
+        for n in items[:3]:
             url = n.get("url") or ""
             nid = str(n.get("id") or url)
             if not nid or not once("news:" + nid):
@@ -270,7 +411,6 @@ def check_news():
 # ALERT: VOLUME SURGE  (Finnhub trades WebSocket, real-time)
 # ----------------------------------------------------------------------
 def _ws_on_message(ws, message):
-    """Accumulate traded volume per symbol from streaming trade ticks."""
     try:
         data = json.loads(message)
     except (ValueError, TypeError):
@@ -286,12 +426,17 @@ def _ws_on_message(ws, message):
 
 
 def _ws_on_open(ws):
-    for sym in WATCHLIST:
+    _ws_app[0] = ws
+    _ws_subscribed.clear()
+    with _watch_lock:
+        syms = set(_watchlist)
+    for sym in syms:
         try:
             ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
+            _ws_subscribed.add(sym)
         except Exception as e:  # noqa: BLE001
             log.error("WS subscribe failed for %s: %s", sym, e)
-    log.info("Volume WebSocket connected; subscribed to %d symbols", len(WATCHLIST))
+    log.info("Volume WebSocket connected; tracking %d runners", len(_ws_subscribed))
 
 
 def _ws_on_error(ws, err):
@@ -318,18 +463,17 @@ def _ws_run():
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:  # noqa: BLE001
             log.error("Volume WebSocket crashed: %s", e)
+        _ws_app[0] = None
         time.sleep(5)  # reconnect backoff
 
 
 def check_volume_surge():
-    """
-    Called once per bucket. Compare the just-finished bucket's volume to the
-    rolling baseline average; alert on a surge, then roll the bucket forward.
-    Networking (send_telegram) happens OUTSIDE the lock.
-    """
+    """Compare each runner's just-finished volume bucket to its rolling baseline."""
+    with _watch_lock:
+        syms = list(_watchlist)
     surges = []
     with _vol_lock:
-        for sym in WATCHLIST:
+        for sym in syms:
             cur = _vol_current.get(sym, 0.0)
             hist = _vol_history[sym]
             if cur >= VOL_MIN_SHARES and len(hist) >= VOL_MIN_SAMPLES:
@@ -356,11 +500,12 @@ def check_volume_surge():
 # MAIN LOOP
 # ----------------------------------------------------------------------
 def main():
-    log.info("Starting alert bot (dry_run=%s). Watchlist: %s", DRY_RUN, ", ".join(WATCHLIST))
+    log.info("Starting small-cap alert bot (dry_run=%s). Filters: $%.2f-$%.2f, "
+             ">=%.0f%%, vol>=%s", DRY_RUN, PRICE_MIN, PRICE_MAX, MIN_PERCENT,
+             format(MIN_VOLUME, ","))
 
     if DRY_RUN:
-        # WebSocket needs a live connection, so just exercise the REST/RSS checks.
-        for fn in (check_halts, check_movers, check_news):
+        for fn in (scan_market, check_halts, check_news):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
@@ -368,31 +513,31 @@ def main():
         log.info("Dry run complete.")
         return
 
-    # Prime de-dup silently so a redeploy doesn't re-blast the existing backlog
-    # (today's whole halt list + already-published news). Only NEW events after
-    # this point will alert -- the same "from now on" behavior as the Make feeds.
+    # Prime the halt feed silently so a redeploy doesn't re-blast today's
+    # existing halt backlog. (The scanner is capped per-scan, so it isn't primed
+    # -- on start it will show whatever is currently running, then only new ones.)
     global _silent
     _silent = True
-    for fn in (check_halts, check_news):
-        try:
-            fn()
-        except Exception as e:  # noqa: BLE001
-            log.error("prime %s failed: %s", fn.__name__, e)
+    try:
+        check_halts()
+    except Exception as e:  # noqa: BLE001
+        log.error("prime check_halts failed: %s", e)
     _silent = False
-    log.info("Primed de-dup on %d existing items; only new events will alert now.",
-             len(_seen))
+    log.info("Primed %d existing halt items; only new events will alert now.", len(_seen))
 
     # Start the volume-surge WebSocket in the background.
     t = threading.Thread(target=_ws_run, daemon=True)
     t.start()
 
     schedule = [
-        (check_halts,         INTERVAL_HALTS),
-        (check_movers,        INTERVAL_MOVERS),
-        (check_news,          INTERVAL_NEWS),
-        (check_volume_surge,  INTERVAL_VOLROLL),
+        (scan_market,        INTERVAL_SCAN),
+        (check_halts,        INTERVAL_HALTS),
+        (check_news,         INTERVAL_NEWS),
+        (check_volume_surge, INTERVAL_VOLROLL),
     ]
-    next_run = {fn.__name__: time.time() + interval for fn, interval in schedule}
+    # Run the first market scan almost immediately so the watchlist populates.
+    next_run = {fn.__name__: time.time() + (2 if fn is scan_market else interval)
+                for fn, interval in schedule}
 
     while True:
         now = time.time()
