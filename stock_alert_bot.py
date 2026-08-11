@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-stock_alert_bot.py  (Finnhub edition)
--------------------------------------
+stock_alert_bot.py  (Finnhub edition + real-time volume surge)
+--------------------------------------------------------------
 Real-time stock-alert bot that posts to a Telegram channel.
 
 Alert types:
   1. Trading HALTS / resumes  -> Nasdaq Trader Trade-Halt RSS (free, official)
-  2. PRICE MOVERS / spikes     -> Finnhub /quote per watchlist symbol (free tier)
-  3. BREAKING NEWS            -> Finnhub /company-news per watchlist symbol (free tier)
+  2. VOLUME SURGE             -> Finnhub trades WebSocket (free, up to 50 symbols)
+  3. PRICE MOVERS / spikes     -> Finnhub /quote per watchlist symbol (free tier)
+  4. BREAKING NEWS            -> Finnhub /company-news per watchlist symbol (free tier)
 
-Why Finnhub: the free tier (60 calls/min, no card) covers real-time quotes and
-company news, which is enough to run a watchlist scanner at no cost. NOTE: the
-free tier is licensed for personal / non-commercial use — upgrade to a paid
-Finnhub plan before charging members.
-
-True volume-surge detection needs candle data (paid) or the Finnhub trades
-WebSocket (free, 50 symbols). This build approximates "spikes" via large % moves;
-see the check_movers() note for where to add the WebSocket later.
+Everything here runs on Finnhub's FREE tier (60 REST calls/min + a trades
+WebSocket for up to 50 symbols) plus the free Nasdaq halt feed. NOTE: the free
+tier is licensed for personal / non-commercial use -- upgrade to a paid Finnhub
+plan before charging members.
 
 --------------------------------------------------------------------------
 QUICK START
 --------------------------------------------------------------------------
-  pip install requests feedparser
+  pip install requests feedparser websocket-client
   export TELEGRAM_BOT_TOKEN="123456:ABC..."     # from @BotFather
   export TELEGRAM_CHAT_ID="-1001234567890"       # your channel id
   export FINNHUB_API_KEY="your_finnhub_key"      # finnhub.io (free)
@@ -34,16 +31,24 @@ On Railway these are set as service Variables (same names, no quotes).
 
 import os
 import sys
+import json
 import time
 import html
 import logging
+import threading
+from collections import defaultdict, deque
 
 import requests
 
 try:
-    import feedparser  # only needed for the halt RSS feed
+    import feedparser  # halt RSS feed
 except ImportError:
     feedparser = None
+
+try:
+    import websocket  # from the `websocket-client` package (volume surge)
+except ImportError:
+    websocket = None
 
 
 # ----------------------------------------------------------------------
@@ -62,20 +67,29 @@ TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = _env("TELEGRAM_CHAT_ID")
 FINNHUB_API_KEY    = _env("FINNHUB_API_KEY")
 
-# Tickers to scan for price moves + news. Keep focused for the free 60/min limit.
+# Tickers to scan. Finnhub's free WebSocket allows up to 50 symbols.
 WATCHLIST = ["AAPL", "TSLA", "NVDA", "AMD", "PLTR", "SOFI", "MARA", "RIOT"]
 
-# Alert thresholds
-MOVERS_MIN_CHANGE = 5.0    # alert when a watchlist symbol moves >= this % (abs)
+# Price-mover thresholds (REST /quote)
+MOVERS_MIN_CHANGE = 5.0    # alert when a symbol moves >= this % (abs)
 MIN_PRICE         = 1.00   # ignore anything under this price
 
+# Volume-surge thresholds (WebSocket trades)
+VOL_BUCKET_SEC = 60        # size of each volume bucket (seconds)
+VOL_HISTORY    = 20        # how many past buckets form the baseline average
+VOL_MIN_SAMPLES = 5        # need this many baseline buckets before alerting
+VOL_SURGE_MULT = 3.0       # fire when a bucket's volume >= this x the baseline avg
+VOL_MIN_SHARES = 5000      # ignore tiny buckets to avoid noise on thin names
+
 # Poll intervals (seconds). Halts are the most time-sensitive.
-INTERVAL_HALTS  = 20
-INTERVAL_MOVERS = 60
-INTERVAL_NEWS   = 180
+INTERVAL_HALTS   = 20
+INTERVAL_MOVERS  = 60
+INTERVAL_NEWS    = 180
+INTERVAL_VOLROLL = VOL_BUCKET_SEC
 
 NASDAQ_HALT_RSS = "http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
 FINNHUB_BASE    = "https://finnhub.io/api/v1"
+FINNHUB_WS      = "wss://ws.finnhub.io?token="
 
 DRY_RUN = "--test" in sys.argv
 
@@ -84,6 +98,11 @@ log = logging.getLogger("alertbot")
 
 # De-dup memory so the same event isn't posted twice in a session.
 _seen = set()
+
+# Volume-surge shared state (written by the WS thread, read by the rollup).
+_vol_lock = threading.Lock()
+_vol_current = defaultdict(float)                       # symbol -> volume this bucket
+_vol_history = defaultdict(lambda: deque(maxlen=VOL_HISTORY))  # symbol -> past buckets
 
 
 # ----------------------------------------------------------------------
@@ -121,7 +140,7 @@ def once(key):
 
 
 # ----------------------------------------------------------------------
-# FINNHUB HELPERS
+# FINNHUB REST HELPER
 # ----------------------------------------------------------------------
 def finnhub_get(path, params=None):
     if not FINNHUB_API_KEY:
@@ -169,15 +188,6 @@ def check_halts():
 # ALERT: PRICE MOVERS / SPIKES  (Finnhub /quote per watchlist symbol)
 # ----------------------------------------------------------------------
 def check_movers():
-    """
-    Free-tier scanner: pull a real-time quote for each watchlist symbol and
-    alert when the day's percent change crosses the threshold.
-
-    To upgrade to true VOLUME-SURGE detection later, subscribe to the Finnhub
-    trades WebSocket (wss://ws.finnhub.io?token=KEY), accumulate per-symbol
-    traded volume in a rolling window, and fire when it exceeds N x the average.
-    That needs the `websocket-client` package and a background thread.
-    """
     for sym in WATCHLIST:
         q = finnhub_get("quote", {"symbol": sym})
         if not isinstance(q, dict):
@@ -200,8 +210,7 @@ def check_movers():
                 + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
                 + "  (" + format(chg, "+.1f") + "%)"
             )
-        # tiny pause to stay well under 60 calls/min across the watchlist
-        time.sleep(0.3)
+        time.sleep(0.3)  # stay under 60 calls/min across the watchlist
 
 
 # ----------------------------------------------------------------------
@@ -228,11 +237,99 @@ def check_news():
 
 
 # ----------------------------------------------------------------------
+# ALERT: VOLUME SURGE  (Finnhub trades WebSocket, real-time)
+# ----------------------------------------------------------------------
+def _ws_on_message(ws, message):
+    """Accumulate traded volume per symbol from streaming trade ticks."""
+    try:
+        data = json.loads(message)
+    except (ValueError, TypeError):
+        return
+    if data.get("type") != "trade":
+        return
+    with _vol_lock:
+        for t in data.get("data", []):
+            sym = t.get("s")
+            vol = t.get("v") or 0
+            if sym:
+                _vol_current[sym] += float(vol)
+
+
+def _ws_on_open(ws):
+    for sym in WATCHLIST:
+        try:
+            ws.send(json.dumps({"type": "subscribe", "symbol": sym}))
+        except Exception as e:  # noqa: BLE001
+            log.error("WS subscribe failed for %s: %s", sym, e)
+    log.info("Volume WebSocket connected; subscribed to %d symbols", len(WATCHLIST))
+
+
+def _ws_on_error(ws, err):
+    log.warning("Volume WebSocket error: %s", err)
+
+
+def _ws_run():
+    """Background thread: keep a Finnhub trades WebSocket alive with reconnect."""
+    if websocket is None:
+        log.warning("websocket-client not installed; volume surge disabled.")
+        return
+    if not FINNHUB_API_KEY:
+        log.warning("FINNHUB_API_KEY not set; volume surge disabled.")
+        return
+    url = FINNHUB_WS + FINNHUB_API_KEY
+    while True:
+        try:
+            ws = websocket.WebSocketApp(
+                url,
+                on_open=_ws_on_open,
+                on_message=_ws_on_message,
+                on_error=_ws_on_error,
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:  # noqa: BLE001
+            log.error("Volume WebSocket crashed: %s", e)
+        time.sleep(5)  # reconnect backoff
+
+
+def check_volume_surge():
+    """
+    Called once per bucket. Compare the just-finished bucket's volume to the
+    rolling baseline average; alert on a surge, then roll the bucket forward.
+    Networking (send_telegram) happens OUTSIDE the lock.
+    """
+    surges = []
+    with _vol_lock:
+        for sym in WATCHLIST:
+            cur = _vol_current.get(sym, 0.0)
+            hist = _vol_history[sym]
+            if cur >= VOL_MIN_SHARES and len(hist) >= VOL_MIN_SAMPLES:
+                avg = sum(hist) / len(hist)
+                if avg > 0 and cur >= VOL_SURGE_MULT * avg:
+                    surges.append((sym, cur, avg))
+            hist.append(cur)
+            _vol_current[sym] = 0.0
+
+    for sym, cur, avg in surges:
+        bucket = time.strftime("%Y%m%d%H%M")
+        if not once("volsurge:" + sym + ":" + bucket):
+            continue
+        rvol = cur / avg if avg else 0
+        send_telegram(
+            "\U0001F50A <b>VOLUME SURGE</b>\n"
+            + "<b>" + html.escape(sym) + "</b>  "
+            + format(int(cur), ",") + " sh this minute = "
+            + format(rvol, ".1f") + "x avg"
+        )
+
+
+# ----------------------------------------------------------------------
 # MAIN LOOP
 # ----------------------------------------------------------------------
 def main():
     log.info("Starting alert bot (dry_run=%s). Watchlist: %s", DRY_RUN, ", ".join(WATCHLIST))
+
     if DRY_RUN:
+        # WebSocket needs a live connection, so just exercise the REST/RSS checks.
         for fn in (check_halts, check_movers, check_news):
             try:
                 fn()
@@ -241,12 +338,17 @@ def main():
         log.info("Dry run complete.")
         return
 
+    # Start the volume-surge WebSocket in the background.
+    t = threading.Thread(target=_ws_run, daemon=True)
+    t.start()
+
     schedule = [
-        (check_halts,  INTERVAL_HALTS),
-        (check_movers, INTERVAL_MOVERS),
-        (check_news,   INTERVAL_NEWS),
+        (check_halts,         INTERVAL_HALTS),
+        (check_movers,        INTERVAL_MOVERS),
+        (check_news,          INTERVAL_NEWS),
+        (check_volume_surge,  INTERVAL_VOLROLL),
     ]
-    next_run = {fn.__name__: 0.0 for fn, _ in schedule}
+    next_run = {fn.__name__: time.time() + interval for fn, interval in schedule}
 
     while True:
         now = time.time()
