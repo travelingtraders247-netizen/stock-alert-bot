@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
 """
-stock_alert_bot.py  (small-cap momentum edition)
-------------------------------------------------
+stock_alert_bot.py  (small-cap momentum edition -- extended hours + news)
+-------------------------------------------------------------------------
 Real-time stock-alert bot that posts to a Telegram channel, focused on
-SMALL-CAP / LOW-FLOAT / PENNY MOMENTUM names -- the stockmembers.com /
-symbolalerts.com style -- instead of a fixed large-cap watchlist.
+SMALL-CAP / LOW-FLOAT / PENNY MOMENTUM names (stockmembers.com /
+symbolalerts.com style).
 
-How it works:
-  * A market-wide SCANNER (discover_movers) pulls the whole US market once a
-    minute and keeps only small, cheap, fast-moving names (widest net:
-    ~$0.10-$20, up >= X%, with real volume). Those become a DYNAMIC watchlist.
-  * The dynamic watchlist then drives the real-time volume-surge WebSocket and
-    the breaking-news check, so every alert is about an actual runner.
+WHY THIS VERSION EXISTS
+-----------------------
+v1 only saw REGULAR-SESSION data and only checked news for symbols the price
+scanner had already flagged. That made it blind to exactly the alerts the
+competitors send:
+  * OFAL was +291% in PREMARKET (04:00-09:30 ET) -- the regular-session
+    screener reports ~0% change then, so it never crossed the filter.
+  * RMCF moved on an SEC filing / press release. It was not a big regular-hours
+    mover, so it never entered the watchlist, so its news was never fetched.
+
+This version fixes both:
+  1. EXTENDED HOURS: polls Nasdaq's free per-symbol extended-trading endpoint
+     during premarket and after-hours, alerting on big gaps with real volume.
+  2. NEWS FIRST: scans news market-wide, then alerts on any small-cap ticker.
+     News tickers also become premarket polling candidates (the catalyst leads
+     the move, so this is what finds runners before they show up on a screener).
 
 Alert types:
-  1. SMALL-CAP RUNNER   -> market-wide scanner (Nasdaq screener, free)
-  2. TRADING HALT       -> Nasdaq Trader Trade-Halt RSS (free, official)
-  3. VOLUME SURGE       -> Finnhub trades WebSocket on the current runners (free)
-  4. BREAKING NEWS      -> Finnhub /company-news on the current runners (free)
+  1. SMALL-CAP RUNNER    -> regular-session market-wide scanner (Nasdaq, free)
+  2. PREMARKET / AFTER-HOURS RUNNER -> Nasdaq extended-trading (free)
+  3. NEWS / CATALYST     -> market-wide news + PR wires, filtered to small caps
+  4. TRADING HALT        -> Nasdaq Trader Trade-Halt RSS (free, official)
+  5. VOLUME SURGE        -> Finnhub trades WebSocket on current runners (free)
 
-HYBRID DATA NOTE: discovery currently uses Nasdaq's free (unofficial) screener
-endpoint -- $0, but it can rate-limit or change without notice, and it has no
-true "float" figure (we approximate low float with shares-outstanding). To move
-to a robust real-time feed later, replace ONLY discover_movers() with a
-Polygon.io/Massive full-market snapshot call; everything downstream is unchanged.
+HYBRID DATA NOTE: every source here is free. The Nasdaq endpoints are
+unofficial and can throttle or change without notice; each failure is logged
+and skipped rather than crashing. "Low float" is approximated with
+shares-outstanding (true float is premium data everywhere).
 
 --------------------------------------------------------------------------
 QUICK START
@@ -40,6 +50,7 @@ On Railway these are set as service Variables (same names, no quotes).
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -47,11 +58,18 @@ import html
 import logging
 import threading
 from collections import defaultdict, deque
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+except Exception:  # noqa: BLE001 - fall back to UTC-ish if tzdata missing
+    ET = None
 
 import requests
 
 try:
-    import feedparser  # halt RSS feed
+    import feedparser  # halt RSS + PR wire feeds
 except ImportError:
     feedparser = None
 
@@ -77,15 +95,22 @@ TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = _env("TELEGRAM_CHAT_ID")
 FINNHUB_API_KEY    = _env("FINNHUB_API_KEY")
 
-# --- Small-cap scanner filters ("widest net": sub-$1 to ~$20) ---
-PRICE_MIN      = 0.10      # ignore essentially-dead sub-penny junk below this
-PRICE_MAX      = 20.00     # small-cap / penny ceiling
-MIN_PERCENT    = 10.0      # only names up at least this % on the day
-MIN_VOLUME     = 100000    # shares traded today (liquidity floor)
-MIN_DOLLAR_VOL = 250000    # price * volume floor (kills illiquid sub-$1 traps)
-TOP_N_ALERTS   = 15        # max NEW runner alerts per scan (paced sender caps rate)
-MAX_WATCH      = 45        # max symbols kept on the free Finnhub WS (cap is 50)
-LOWFLOAT_MAX_M = 50.0      # shares-out (millions) under which we tag "LOW FLOAT"
+# --- Small-cap universe / regular-session filters ---
+PRICE_MIN      = 0.10
+PRICE_MAX      = 20.00
+MAX_MARKET_CAP = 2_000_000_000     # ignore anything bigger than ~$2B
+MIN_PERCENT    = 10.0              # regular-hours move threshold
+MIN_VOLUME     = 100000
+MIN_DOLLAR_VOL = 250000
+TOP_N_ALERTS   = 15
+MAX_WATCH      = 45                # free Finnhub WS cap is 50
+LOWFLOAT_MAX_M = 50.0              # shares-out (millions) -> "LOW FLOAT" tag
+
+# --- Extended-hours (premarket / after-hours) filters ---
+PM_MIN_PERCENT   = 20.0            # bigger threshold: extended moves are wilder
+PM_MIN_VOLUME    = 50000           # extended-session share volume floor
+MAX_PM_CANDIDATES = 200            # symbols polled per extended scan
+PM_REQ_GAP       = 0.25            # seconds between extended-quote requests
 
 # Volume-surge thresholds (WebSocket trades)
 VOL_BUCKET_SEC  = 60
@@ -94,16 +119,19 @@ VOL_MIN_SAMPLES = 5
 VOL_SURGE_MULT  = 3.0
 VOL_MIN_SHARES  = 5000
 
-# Poll intervals (seconds).
-INTERVAL_SCAN    = 60
-INTERVAL_HALTS   = 20
-INTERVAL_NEWS    = 180
-INTERVAL_VOLROLL = VOL_BUCKET_SEC
+# Poll intervals (seconds)
+INTERVAL_SCAN     = 60
+INTERVAL_EXTENDED = 120
+INTERVAL_UNIVERSE = 600
+INTERVAL_HALTS    = 20
+INTERVAL_NEWS     = 120
+INTERVAL_VOLROLL  = VOL_BUCKET_SEC
 
 NASDAQ_HALT_RSS = "http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
-# Unofficial Nasdaq screener: whole US market in one call (symbol/price/%chg/vol/mcap).
 NASDAQ_SCREENER = ("https://api.nasdaq.com/api/screener/stocks"
                    "?tableonly=true&limit=6000&offset=0&download=true")
+NASDAQ_EXTENDED = ("https://api.nasdaq.com/api/quote/{sym}/extended-trading"
+                   "?assetclass=stocks&markettype={mt}&time=1")
 NASDAQ_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -115,17 +143,21 @@ NASDAQ_HEADERS = {
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 FINNHUB_WS   = "wss://ws.finnhub.io?token="
 
+# Free PR-wire RSS feeds (no key). These carry the catalysts that move small caps.
+PR_FEEDS = [
+    "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire-News-about-Public-Companies",
+    "https://www.prnewswire.com/rss/news-releases-list.rss",
+]
+
 DRY_RUN = "--test" in sys.argv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("alertbot")
 
-# De-dup memory so the same event isn't posted twice in a session.
+# De-dup memory so the same event isn't posted twice.
 _seen = set()
 
-# Optional on-disk de-dup so a redeploy doesn't re-post the same runners.
-# Persists across restarts IF a Railway Volume is mounted at /data; otherwise it
-# falls back to a local (ephemeral) file and simply behaves as before.
+# Optional on-disk de-dup so a redeploy doesn't re-post the same alerts.
 SEEN_PATH = (_env("DEDUP_PATH")
              or ("/data/seen.json" if os.path.isdir("/data") else "seen_state.json"))
 
@@ -154,25 +186,54 @@ def _save_seen():
     except OSError as e:
         log.warning("Could not save de-dup file (%s): %s", SEEN_PATH, e)
 
+
 # Global send pacing so a burst never trips Telegram's flood limit.
 _send_lock = threading.Lock()
 _last_send_ts = [0.0]
 MIN_SEND_GAP = 3.1     # ~19 msgs/min: stays under Telegram's ~20/min channel cap
 _silent = False
 
-# Dynamic watchlist (the current small-cap runners) shared across threads.
+# Small-cap universe: symbol -> {"close": float, "mcap": float, "name": str, "vol": float}
+_universe = {}
+_universe_lock = threading.Lock()
+
+# Tickers with a catalyst today (news/filing/halt) -> priority premarket candidates.
+_catalyst = set()
+
+# Dynamic watchlist (current runners) shared across threads.
 _watch_lock = threading.Lock()
 _watchlist = set()
-_profile_cache = {}   # symbol -> {"shares_out_m": float|None}
+_profile_cache = {}
 
 # Volume-surge shared state (written by the WS thread, read by the rollup).
 _vol_lock = threading.Lock()
 _vol_current = defaultdict(float)
 _vol_history = defaultdict(lambda: deque(maxlen=VOL_HISTORY))
 
-# Live WebSocket handle + what it's currently subscribed to (managed dynamically).
 _ws_app = [None]
 _ws_subscribed = set()
+
+
+# ----------------------------------------------------------------------
+# SESSION CLOCK (US/Eastern)
+# ----------------------------------------------------------------------
+def now_et():
+    return datetime.now(ET) if ET else datetime.utcnow()
+
+
+def session():
+    """Return 'pre', 'regular', 'post', or 'closed' for the current ET time."""
+    n = now_et()
+    if n.weekday() >= 5:                 # Sat/Sun
+        return "closed"
+    mins = n.hour * 60 + n.minute
+    if 4 * 60 <= mins < 9 * 60 + 30:
+        return "pre"
+    if 9 * 60 + 30 <= mins < 16 * 60:
+        return "regular"
+    if 16 * 60 <= mins < 20 * 60:
+        return "post"
+    return "closed"
 
 
 # ----------------------------------------------------------------------
@@ -229,47 +290,7 @@ def once(key):
 
 
 # ----------------------------------------------------------------------
-# FINNHUB REST HELPER
-# ----------------------------------------------------------------------
-def finnhub_get(path, params=None):
-    if not FINNHUB_API_KEY:
-        log.warning("FINNHUB_API_KEY not set; skipping %s", path)
-        return None
-    params = dict(params or {})
-    params["token"] = FINNHUB_API_KEY
-    try:
-        r = requests.get(FINNHUB_BASE + "/" + path, params=params, timeout=15)
-        if r.status_code == 429:
-            log.warning("Finnhub rate limit hit on %s; backing off", path)
-            time.sleep(2)
-            return None
-        if r.status_code != 200:
-            log.error("Finnhub %s -> %s: %s", path, r.status_code, r.text[:150])
-            return None
-        return r.json()
-    except (requests.RequestException, ValueError) as e:
-        log.error("Finnhub request failed (%s): %s", path, e)
-        return None
-
-
-def shares_out_millions(sym):
-    """Best-effort shares-outstanding in millions (our free 'low float' proxy)."""
-    if sym in _profile_cache:
-        return _profile_cache[sym].get("shares_out_m")
-    val = None
-    prof = finnhub_get("stock/profile2", {"symbol": sym})
-    if isinstance(prof, dict):
-        try:
-            so = prof.get("shareOutstanding")
-            val = float(so) if so else None   # Finnhub returns this in millions
-        except (TypeError, ValueError):
-            val = None
-    _profile_cache[sym] = {"shares_out_m": val}
-    return val
-
-
-# ----------------------------------------------------------------------
-# MARKET-WIDE DISCOVERY  (free Nasdaq screener)
+# HELPERS
 # ----------------------------------------------------------------------
 def _num(s):
     """Parse '$1.23', '12.34%', '1,234,567', '--' -> float or None."""
@@ -284,17 +305,104 @@ def _num(s):
         return None
 
 
-def discover_movers():
-    """
-    Pull the whole US market and return small-cap momentum candidates:
-    [{"symbol","price","pct","volume"}], already filtered and sorted by % desc.
-
-    HYBRID UPGRADE POINT: to switch to a paid real-time feed later, replace the
-    body of this function with a Polygon.io/Massive full-market snapshot call
-    that returns the same list of dicts. Nothing else needs to change.
-    """
+def finnhub_get(path, params=None):
+    if not FINNHUB_API_KEY:
+        return None
+    params = dict(params or {})
+    params["token"] = FINNHUB_API_KEY
     try:
-        r = requests.get(NASDAQ_SCREENER, headers=NASDAQ_HEADERS, timeout=20)
+        r = requests.get(FINNHUB_BASE + "/" + path, params=params, timeout=15)
+        if r.status_code == 429:
+            log.warning("Finnhub rate limit on %s; backing off", path)
+            time.sleep(2)
+            return None
+        if r.status_code != 200:
+            log.error("Finnhub %s -> %s: %s", path, r.status_code, r.text[:150])
+            return None
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.error("Finnhub request failed (%s): %s", path, e)
+        return None
+
+
+def shares_out_millions(sym):
+    """Best-effort shares-outstanding in millions (free 'low float' proxy)."""
+    if sym in _profile_cache:
+        return _profile_cache[sym].get("shares_out_m")
+    val = None
+    prof = finnhub_get("stock/profile2", {"symbol": sym})
+    if isinstance(prof, dict):
+        try:
+            so = prof.get("shareOutstanding")
+            val = float(so) if so else None
+        except (TypeError, ValueError):
+            val = None
+    _profile_cache[sym] = {"shares_out_m": val}
+    return val
+
+
+def lowfloat_tag(sym):
+    so = shares_out_millions(sym)
+    if so is not None and so <= LOWFLOAT_MAX_M:
+        return "  •  \U0001F53B LOW FLOAT ~" + format(so, ".1f") + "M sh"
+    return ""
+
+
+# ----------------------------------------------------------------------
+# UNIVERSE  (whole US market -> small-cap subset)
+# ----------------------------------------------------------------------
+def refresh_universe():
+    """Pull the full market once and cache the small-cap subset with prior close."""
+    try:
+        r = requests.get(NASDAQ_SCREENER, headers=NASDAQ_HEADERS, timeout=25)
+    except requests.RequestException as e:
+        log.error("Universe fetch failed: %s", e)
+        return
+    if r.status_code != 200:
+        log.error("Universe HTTP %s (Nasdaq may be throttling)", r.status_code)
+        return
+    try:
+        data = r.json().get("data") or {}
+    except ValueError:
+        log.error("Universe returned non-JSON")
+        return
+    rows = data.get("rows") or (data.get("table") or {}).get("rows") or []
+    if not rows:
+        log.warning("Universe returned no rows.")
+        return
+
+    uni = {}
+    for row in rows:
+        sym = (row.get("symbol") or "").strip().upper()
+        price = _num(row.get("lastsale"))
+        if not sym or price is None:
+            continue
+        if "^" in sym or "/" in sym or "." in sym:
+            continue
+        if price < PRICE_MIN or price > PRICE_MAX:
+            continue
+        mcap = _num(row.get("marketCap"))
+        if mcap is not None and mcap > MAX_MARKET_CAP:
+            continue
+        uni[sym] = {
+            "close": price,
+            "mcap": mcap,
+            "name": (row.get("name") or "").strip(),
+            "vol": _num(row.get("volume")) or 0.0,
+        }
+    with _universe_lock:
+        _universe.clear()
+        _universe.update(uni)
+    log.info("Universe: %d rows -> %d small-cap symbols", len(rows), len(uni))
+
+
+# ----------------------------------------------------------------------
+# ALERT 1: REGULAR-SESSION RUNNERS
+# ----------------------------------------------------------------------
+def discover_movers():
+    """Regular-hours movers from the market-wide screener (sorted by % desc)."""
+    try:
+        r = requests.get(NASDAQ_SCREENER, headers=NASDAQ_HEADERS, timeout=25)
     except requests.RequestException as e:
         log.error("Scanner fetch failed: %s", e)
         return []
@@ -304,11 +412,9 @@ def discover_movers():
     try:
         data = r.json().get("data") or {}
     except ValueError:
-        log.error("Scanner returned non-JSON (%d bytes)", len(r.content))
+        log.error("Scanner returned non-JSON")
         return []
-    rows = data.get("rows")
-    if rows is None:
-        rows = (data.get("table") or {}).get("rows")
+    rows = data.get("rows") or (data.get("table") or {}).get("rows") or []
     if not rows:
         log.warning("Scanner returned no rows.")
         return []
@@ -321,7 +427,7 @@ def discover_movers():
         vol = _num(row.get("volume"))
         if not sym or price is None or pct is None or vol is None:
             continue
-        if "^" in sym or "/" in sym or "." in sym:   # skip warrants/units/odd tickers
+        if "^" in sym or "/" in sym or "." in sym:
             continue
         if price < PRICE_MIN or price > PRICE_MAX:
             continue
@@ -356,21 +462,20 @@ def _ws_sync(desired):
 
 
 def scan_market():
-    """Find small-cap runners, alert new ones, and refresh the dynamic watchlist."""
+    """Regular hours only: find runners, alert new ones, refresh the watchlist."""
+    if session() != "regular":
+        return
     movers = discover_movers()
     if not movers:
         return
 
-    top = movers[:MAX_WATCH]
-    desired = {m["symbol"] for m in top}
-
-    # Refresh the shared watchlist that news + volume-surge use.
+    desired = {m["symbol"] for m in movers[:MAX_WATCH]}
     with _watch_lock:
         _watchlist.clear()
         _watchlist.update(desired)
     _ws_sync(desired)
 
-    day = time.strftime("%Y%m%d")
+    day = now_et().strftime("%Y%m%d")
     alerted = 0
     for m in movers:
         if alerted >= TOP_N_ALERTS:
@@ -378,26 +483,218 @@ def scan_market():
         sym = m["symbol"]
         if not once("runner:" + sym + ":" + day):
             continue
-        so = shares_out_millions(sym)
-        tag = ""
-        if so is not None and so <= LOWFLOAT_MAX_M:
-            tag = "  •  \U0001F53B LOW FLOAT ~" + format(so, ".1f") + "M shares"
-        arrow = "\U0001F680"  # rocket
         send_telegram(
-            arrow + " <b>SMALL-CAP RUNNER</b>\n"
+            "\U0001F680 <b>SMALL-CAP RUNNER</b>\n"
             + "<b>" + html.escape(sym) + "</b>  $" + format(m["price"], ",.2f")
             + "  (" + format(m["pct"], "+.1f") + "%)\n"
-            + "Vol: " + format(int(m["volume"]), ",") + tag
+            + "Vol: " + format(int(m["volume"]), ",") + lowfloat_tag(sym)
         )
         alerted += 1
 
 
 # ----------------------------------------------------------------------
-# ALERT: TRADING HALTS  (Nasdaq Trader RSS, free -- already market-wide)
+# ALERT 2: PREMARKET / AFTER-HOURS RUNNERS  (Nasdaq extended-trading, free)
+# ----------------------------------------------------------------------
+_PCT_RE = re.compile(r"\(([+-]?[\d.]+)\s*%\)")
+_PRICE_RE = re.compile(r"\$([\d.]+)")
+
+
+def parse_extended(payload):
+    """
+    Parse Nasdaq's extended-trading JSON.
+    Returns {"price","pct","volume","high"} or None.
+    """
+    try:
+        d = (payload or {}).get("data") or {}
+        info = d.get("infoTable") or {}
+        rows = info.get("rows") or []
+        if not rows:
+            return None
+        row = rows[0]
+        cons = str(row.get("consolidated") or "")
+        pm = _PRICE_RE.search(cons)
+        pc = _PCT_RE.search(cons)
+        if not pm or not pc:
+            return None
+        hm = _PRICE_RE.search(str(row.get("highPrice") or ""))
+        return {
+            "price": float(pm.group(1)),
+            "pct": float(pc.group(1)),
+            "volume": _num(row.get("volume")) or 0.0,
+            "high": float(hm.group(1)) if hm else None,
+        }
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def fetch_extended(sym, markettype):
+    """Fetch one symbol's extended-hours quote. Returns parsed dict or None."""
+    url = NASDAQ_EXTENDED.format(sym=sym, mt=markettype)
+    try:
+        r = requests.get(url, headers=NASDAQ_HEADERS, timeout=12)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        return parse_extended(r.json())
+    except ValueError:
+        return None
+
+
+def build_candidates():
+    """
+    Symbols worth polling in extended hours, highest-signal first:
+      1. today's catalyst names (news / filings / halts)
+      2. names already flagged as runners
+      3. most-active small caps from the last session (fills the remainder)
+    """
+    with _universe_lock:
+        uni = dict(_universe)
+    if not uni:
+        return []
+    ordered = []
+    seen = set()
+    for group in (sorted(_catalyst), sorted(_watchlist)):
+        for s in group:
+            if s in uni and s not in seen:
+                ordered.append(s)
+                seen.add(s)
+    filler = sorted(uni.items(), key=lambda kv: kv[1].get("vol") or 0, reverse=True)
+    for s, _info in filler:
+        if len(ordered) >= MAX_PM_CANDIDATES:
+            break
+        if s not in seen:
+            ordered.append(s)
+            seen.add(s)
+    return ordered[:MAX_PM_CANDIDATES]
+
+
+def scan_extended():
+    """Premarket / after-hours gap scanner."""
+    sess = session()
+    if sess not in ("pre", "post"):
+        return
+    markettype = "pre" if sess == "pre" else "post"
+    cands = build_candidates()
+    if not cands:
+        return
+
+    label = "PREMARKET" if sess == "pre" else "AFTER-HOURS"
+    day = now_et().strftime("%Y%m%d")
+    hits = 0
+    checked = 0
+    for sym in cands:
+        q = fetch_extended(sym, markettype)
+        checked += 1
+        time.sleep(PM_REQ_GAP)
+        if not q:
+            continue
+        price, pct, vol = q["price"], q["pct"], q["volume"]
+        if price < PRICE_MIN or price > PRICE_MAX:
+            continue
+        if pct < PM_MIN_PERCENT or vol < PM_MIN_VOLUME:
+            continue
+        # Re-alert only on a materially bigger move (every extra 50%).
+        tier = int(pct // 50)
+        if not once("ext:" + markettype + ":" + sym + ":" + day + ":" + str(tier)):
+            continue
+        high = q.get("high")
+        extra = ("\n" + label.title() + " High: $" + format(high, ",.2f")) if high else ""
+        send_telegram(
+            "\U0001F680 <b>" + label + " RUNNER</b>\n"
+            + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
+            + "  (" + format(pct, "+.1f") + "%)" + extra + "\n"
+            + label.title() + " Vol: " + format(int(vol), ",") + lowfloat_tag(sym)
+        )
+        hits += 1
+    log.info("%s scan: polled %d candidates -> %d alerts", label, checked, hits)
+
+
+# ----------------------------------------------------------------------
+# ALERT 3: MARKET-WIDE NEWS / CATALYSTS
+# ----------------------------------------------------------------------
+_TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
+
+
+def tickers_in(text):
+    """Uppercase tokens in text that are real symbols in our small-cap universe."""
+    if not text:
+        return set()
+    with _universe_lock:
+        uni = _universe
+        return {t for t in _TICKER_RE.findall(text.upper()) if t in uni}
+
+
+def _news_alert(sym, headline, source, url, tag="NEWS"):
+    with _universe_lock:
+        info = _universe.get(sym) or {}
+    px = info.get("close")
+    price_str = ("  $" + format(px, ",.2f")) if px else ""
+    send_telegram(
+        "\U0001F4F0 <b>" + tag + "</b>  <b>" + html.escape(sym) + "</b>" + price_str + "\n"
+        + html.escape(headline[:250])
+        + ("\n<i>" + html.escape(source) + "</i>" if source else "")
+        + ("\n" + url if url else "")
+        + lowfloat_tag(sym)
+    )
+
+
+def check_market_news():
+    """
+    Scan news MARKET-WIDE (not just the watchlist) and alert on any small-cap
+    ticker. Also records those tickers as premarket polling candidates.
+    """
+    found = 0
+
+    # --- Source A: Finnhub general market news (free tier, has `related` tickers)
+    items = finnhub_get("news", {"category": "general"})
+    if isinstance(items, list):
+        for n in items[:60]:
+            url = n.get("url") or ""
+            nid = "news:" + str(n.get("id") or url)
+            headline = str(n.get("headline") or "")
+            related = str(n.get("related") or "")
+            syms = tickers_in(related) or tickers_in(headline)
+            if not syms:
+                continue
+            for sym in list(syms)[:2]:
+                _catalyst.add(sym)
+                if once(nid + ":" + sym):
+                    _news_alert(sym, headline, str(n.get("source") or ""), url)
+                    found += 1
+
+    # --- Source B: free PR wires (where small-cap catalysts break first)
+    if feedparser is not None:
+        for feed_url in PR_FEEDS:
+            try:
+                feed = feedparser.parse(feed_url)
+            except Exception as e:  # noqa: BLE001
+                log.warning("PR feed error (%s): %s", feed_url, e)
+                continue
+            for entry in getattr(feed, "entries", [])[:40]:
+                title = entry.get("title", "")
+                link = entry.get("link", "")
+                syms = tickers_in(title)
+                if not syms:
+                    continue
+                for sym in list(syms)[:2]:
+                    _catalyst.add(sym)
+                    key = "pr:" + (entry.get("id") or link or title)[:120] + ":" + sym
+                    if once(key):
+                        _news_alert(sym, title, "PR Wire", link, tag="CATALYST")
+                        found += 1
+
+    if found:
+        log.info("News scan: %d new catalyst alerts (%d tickers tracked)",
+                 found, len(_catalyst))
+
+
+# ----------------------------------------------------------------------
+# ALERT 4: TRADING HALTS
 # ----------------------------------------------------------------------
 def check_halts():
     if feedparser is None:
-        log.warning("feedparser not installed; skipping halts. pip install feedparser")
         return
     try:
         feed = feedparser.parse(NASDAQ_HALT_RSS)
@@ -408,38 +705,15 @@ def check_halts():
         eid = entry.get("id") or entry.get("link") or entry.get("title", "")
         if not eid or not once("halt:" + eid):
             continue
-        title = html.escape(entry.get("title", "Trading halt"))
-        summary = html.escape(entry.get("summary", ""))[:300]
-        send_telegram("\U0001F6A8 <b>TRADING HALT</b>\n" + title + "\n" + summary)
+        title = entry.get("title", "Trading halt")
+        for s in tickers_in(title):
+            _catalyst.add(s)          # halted names are prime premarket candidates
+        send_telegram("\U0001F6A8 <b>TRADING HALT</b>\n" + html.escape(title) + "\n"
+                      + html.escape(entry.get("summary", ""))[:300])
 
 
 # ----------------------------------------------------------------------
-# ALERT: BREAKING NEWS  (Finnhub /company-news on the current runners)
-# ----------------------------------------------------------------------
-def check_news():
-    with _watch_lock:
-        syms = sorted(_watchlist)
-    today = time.strftime("%Y-%m-%d")
-    for sym in syms:
-        items = finnhub_get("company-news", {"symbol": sym, "from": today, "to": today})
-        if not isinstance(items, list):
-            continue
-        for n in items[:3]:
-            url = n.get("url") or ""
-            nid = str(n.get("id") or url)
-            if not nid or not once("news:" + nid):
-                continue
-            headline = html.escape(str(n.get("headline", "")))
-            source = html.escape(str(n.get("source", "")))
-            send_telegram(
-                "\U0001F4F0 <b>NEWS</b> " + html.escape(sym) + "\n"
-                + headline + "\n<i>" + source + "</i>\n" + url
-            )
-        time.sleep(0.3)
-
-
-# ----------------------------------------------------------------------
-# ALERT: VOLUME SURGE  (Finnhub trades WebSocket, real-time)
+# ALERT 5: VOLUME SURGE  (Finnhub trades WebSocket, real-time)
 # ----------------------------------------------------------------------
 def _ws_on_message(ws, message):
     try:
@@ -475,7 +749,6 @@ def _ws_on_error(ws, err):
 
 
 def _ws_run():
-    """Background thread: keep a Finnhub trades WebSocket alive with reconnect."""
     if websocket is None:
         log.warning("websocket-client not installed; volume surge disabled.")
         return
@@ -495,11 +768,10 @@ def _ws_run():
         except Exception as e:  # noqa: BLE001
             log.error("Volume WebSocket crashed: %s", e)
         _ws_app[0] = None
-        time.sleep(5)  # reconnect backoff
+        time.sleep(5)
 
 
 def check_volume_surge():
-    """Compare each runner's just-finished volume bucket to its rolling baseline."""
     with _watch_lock:
         syms = list(_watchlist)
     surges = []
@@ -515,7 +787,7 @@ def check_volume_surge():
             _vol_current[sym] = 0.0
 
     for sym, cur, avg in surges:
-        bucket = time.strftime("%Y%m%d%H%M")
+        bucket = now_et().strftime("%Y%m%d%H%M")
         if not once("volsurge:" + sym + ":" + bucket):
             continue
         rvol = cur / avg if avg else 0
@@ -531,12 +803,15 @@ def check_volume_surge():
 # MAIN LOOP
 # ----------------------------------------------------------------------
 def main():
-    log.info("Starting small-cap alert bot (dry_run=%s). Filters: $%.2f-$%.2f, "
-             ">=%.0f%%, vol>=%s", DRY_RUN, PRICE_MIN, PRICE_MAX, MIN_PERCENT,
-             format(MIN_VOLUME, ","))
+    log.info("Starting small-cap alert bot (dry_run=%s). Session=%s. "
+             "Regular: $%.2f-$%.2f >=%.0f%% | Extended: >=%.0f%% vol>=%s",
+             DRY_RUN, session(), PRICE_MIN, PRICE_MAX, MIN_PERCENT,
+             PM_MIN_PERCENT, format(PM_MIN_VOLUME, ","))
+
+    refresh_universe()
 
     if DRY_RUN:
-        for fn in (scan_market, check_halts, check_news):
+        for fn in (scan_market, scan_extended, check_market_news, check_halts):
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
@@ -544,14 +819,9 @@ def main():
         log.info("Dry run complete.")
         return
 
-    # Restore today's de-dup memory from disk so a redeploy doesn't re-post the
-    # runners/news/halts already sent earlier today (needs a Railway Volume at
-    # /data to survive redeploys; otherwise this is a no-op).
     _load_seen()
 
-    # Prime the halt feed silently so a redeploy doesn't re-blast today's
-    # existing halt backlog. (The scanner is capped per-scan, so it isn't primed
-    # -- on start it will show whatever is currently running, then only new ones.)
+    # Prime the halt feed silently so a redeploy doesn't re-blast today's backlog.
     global _silent
     _silent = True
     try:
@@ -559,20 +829,22 @@ def main():
     except Exception as e:  # noqa: BLE001
         log.error("prime check_halts failed: %s", e)
     _silent = False
-    log.info("Primed %d existing halt items; only new events will alert now.", len(_seen))
+    log.info("Primed %d existing items; only new events will alert now.", len(_seen))
 
-    # Start the volume-surge WebSocket in the background.
     t = threading.Thread(target=_ws_run, daemon=True)
     t.start()
 
     schedule = [
+        (refresh_universe,   INTERVAL_UNIVERSE),
         (scan_market,        INTERVAL_SCAN),
+        (scan_extended,      INTERVAL_EXTENDED),
+        (check_market_news,  INTERVAL_NEWS),
         (check_halts,        INTERVAL_HALTS),
-        (check_news,         INTERVAL_NEWS),
         (check_volume_surge, INTERVAL_VOLROLL),
     ]
-    # Run the first market scan almost immediately so the watchlist populates.
-    next_run = {fn.__name__: time.time() + (2 if fn is scan_market else interval)
+    # Kick off the scanners almost immediately so alerts start flowing.
+    soon = (scan_market, scan_extended, check_market_news)
+    next_run = {fn.__name__: time.time() + (3 if fn in soon else interval)
                 for fn, interval in schedule}
     last_saved_n = len(_seen)
 
@@ -584,8 +856,7 @@ def main():
                     fn()
                 except Exception as e:  # noqa: BLE001 - never let one feed kill the loop
                     log.error("%s failed: %s", fn.__name__, e)
-                next_run[fn.__name__] = now + interval
-        # Persist de-dup only when something new was actually sent.
+                next_run[fn.__name__] = time.time() + interval
         if len(_seen) != last_saved_n:
             _save_seen()
             last_saved_n = len(_seen)
