@@ -126,7 +126,7 @@ _seen = set()
 # Global send pacing so a burst never trips Telegram's flood limit.
 _send_lock = threading.Lock()
 _last_send_ts = [0.0]
-MIN_SEND_GAP = 1.2
+MIN_SEND_GAP = 3.1     # ~19 msgs/min: stays under Telegram's ~20/min channel cap
 _silent = False
 
 # Dynamic watchlist (the current small-cap runners) shared across threads.
