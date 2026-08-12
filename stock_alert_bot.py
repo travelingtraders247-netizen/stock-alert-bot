@@ -123,6 +123,37 @@ log = logging.getLogger("alertbot")
 # De-dup memory so the same event isn't posted twice in a session.
 _seen = set()
 
+# Optional on-disk de-dup so a redeploy doesn't re-post the same runners.
+# Persists across restarts IF a Railway Volume is mounted at /data; otherwise it
+# falls back to a local (ephemeral) file and simply behaves as before.
+SEEN_PATH = (_env("DEDUP_PATH")
+             or ("/data/seen.json" if os.path.isdir("/data") else "seen_state.json"))
+
+
+def _load_seen():
+    """Load today's de-dup keys from disk (ignore the file if it's from another day)."""
+    try:
+        with open(SEEN_PATH) as f:
+            blob = json.load(f)
+    except (OSError, ValueError):
+        return
+    if blob.get("date") == time.strftime("%Y%m%d"):
+        _seen.update(blob.get("seen", []))
+        log.info("Loaded %d de-dup keys from %s", len(_seen), SEEN_PATH)
+    else:
+        log.info("De-dup file is from another day; starting fresh today.")
+
+
+def _save_seen():
+    """Atomically write the current de-dup set (with today's date) to disk."""
+    try:
+        tmp = SEEN_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"date": time.strftime("%Y%m%d"), "seen": sorted(_seen)}, f)
+        os.replace(tmp, SEEN_PATH)
+    except OSError as e:
+        log.warning("Could not save de-dup file (%s): %s", SEEN_PATH, e)
+
 # Global send pacing so a burst never trips Telegram's flood limit.
 _send_lock = threading.Lock()
 _last_send_ts = [0.0]
@@ -513,6 +544,11 @@ def main():
         log.info("Dry run complete.")
         return
 
+    # Restore today's de-dup memory from disk so a redeploy doesn't re-post the
+    # runners/news/halts already sent earlier today (needs a Railway Volume at
+    # /data to survive redeploys; otherwise this is a no-op).
+    _load_seen()
+
     # Prime the halt feed silently so a redeploy doesn't re-blast today's
     # existing halt backlog. (The scanner is capped per-scan, so it isn't primed
     # -- on start it will show whatever is currently running, then only new ones.)
@@ -538,6 +574,7 @@ def main():
     # Run the first market scan almost immediately so the watchlist populates.
     next_run = {fn.__name__: time.time() + (2 if fn is scan_market else interval)
                 for fn, interval in schedule}
+    last_saved_n = len(_seen)
 
     while True:
         now = time.time()
@@ -548,6 +585,10 @@ def main():
                 except Exception as e:  # noqa: BLE001 - never let one feed kill the loop
                     log.error("%s failed: %s", fn.__name__, e)
                 next_run[fn.__name__] = now + interval
+        # Persist de-dup only when something new was actually sent.
+        if len(_seen) != last_saved_n:
+            _save_seen()
+            last_saved_n = len(_seen)
         time.sleep(1)
 
 
