@@ -209,6 +209,7 @@ _profile_cache = {}
 _vol_lock = threading.Lock()
 _vol_current = defaultdict(float)
 _vol_history = defaultdict(lambda: deque(maxlen=VOL_HISTORY))
+_vol_lastpx = {}          # symbol -> last real-time trade price from the WS
 
 _ws_app = [None]
 _ws_subscribed = set()
@@ -725,6 +726,9 @@ def _ws_on_message(ws, message):
             vol = t.get("v") or 0
             if sym:
                 _vol_current[sym] += float(vol)
+                px = t.get("p")
+                if px:
+                    _vol_lastpx[sym] = float(px)
 
 
 def _ws_on_open(ws):
@@ -779,20 +783,21 @@ def check_volume_surge():
             if cur >= VOL_MIN_SHARES and len(hist) >= VOL_MIN_SAMPLES:
                 avg = sum(hist) / len(hist)
                 if avg > 0 and cur >= VOL_SURGE_MULT * avg:
-                    surges.append((sym, cur, avg))
+                    surges.append((sym, _vol_lastpx.get(sym)))
             hist.append(cur)
             _vol_current[sym] = 0.0
 
-    for sym, cur, avg in surges:
+    for sym, px in surges:
         bucket = now_et().strftime("%Y%m%d%H%M")
         if not once("volsurge:" + sym + ":" + bucket):
             continue
-        rvol = cur / avg if avg else 0
+        if px is None:                      # WS price missing -> fall back to close
+            with _universe_lock:
+                px = (_universe.get(sym) or {}).get("close")
+        price_str = ("  $" + format(px, ",.2f")) if px else ""
         send_telegram(
             "\U0001F50A <b>VOLUME SURGE</b>\n"
-            + "<b>" + html.escape(sym) + "</b>  "
-            + format(int(cur), ",") + " sh this minute = "
-            + format(rvol, ".1f") + "x avg"
+            + "<b>" + html.escape(sym) + "</b>" + price_str
         )
 
 
