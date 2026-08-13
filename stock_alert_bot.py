@@ -634,9 +634,6 @@ def _news_alert(sym, headline, source, url, tag="NEWS"):
     send_telegram(
         "\U0001F4F0 <b>" + tag + "</b>  <b>" + html.escape(sym) + "</b>" + price_str + "\n"
         + html.escape(headline[:250])
-        + ("\n<i>" + html.escape(source) + "</i>" if source else "")
-        + ("\n" + url if url else "")
-        + lowfloat_tag(sym)
     )
 
 
