@@ -142,6 +142,7 @@ NASDAQ_HEADERS = {
     "Origin": "https://www.nasdaq.com",
     "Referer": "https://www.nasdaq.com/",
 }
+NASDAQ_QUOTE    = "https://api.nasdaq.com/api/quote/{sym}/info?assetclass=stocks"
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 FINNHUB_WS   = "wss://ws.finnhub.io?token="
 
@@ -342,6 +343,25 @@ def shares_out_millions(sym):
             val = None
     _profile_cache[sym] = {"shares_out_m": val}
     return val
+
+
+def current_price(sym):
+    """Best-effort live price: WS last trade -> Nasdaq real-time quote -> prior close."""
+    with _vol_lock:
+        px = _vol_lastpx.get(sym)
+    if px:
+        return px
+    try:
+        r = requests.get(NASDAQ_QUOTE.format(sym=sym), headers=NASDAQ_HEADERS, timeout=8)
+        if r.status_code == 200:
+            pdata = ((r.json().get("data") or {}).get("primaryData") or {})
+            px = _num(pdata.get("lastSalePrice"))
+            if px:
+                return px
+    except (requests.RequestException, ValueError):
+        pass
+    with _universe_lock:
+        return (_universe.get(sym) or {}).get("close")
 
 
 def lowfloat_tag(sym):
@@ -735,11 +755,21 @@ def check_halts():
         eid = entry.get("id") or entry.get("link") or entry.get("title", "")
         if not eid or not once("halt:" + eid):
             continue
-        title = entry.get("title", "Trading halt")
-        for s in tickers_in(title):
-            _catalyst.add(s)          # halted names are prime premarket candidates
-        send_telegram("\U0001F6A8 <b>TRADING HALT</b>\n" + html.escape(title) + "\n"
-                      + html.escape(entry.get("summary", ""))[:300])
+        if _silent:
+            continue        # priming a redeploy: record the id, don't fetch or send
+        # The feed's <title> is just the ticker (e.g. "NIPG"). Its <description>
+        # is a raw HTML table -- deliberately ignored so it never hits the channel.
+        sym = (entry.get("ndaq_issuesymbol")
+               or entry.get("title", "")).strip().upper()
+        if not sym or not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,7}", sym):
+            continue
+        _catalyst.add(sym)            # halted names are prime premarket candidates
+        px = current_price(sym)
+        price_str = ("  $" + format(px, ",.2f")) if px else ""
+        send_telegram(
+            "\U0001F6A8 <b>TRADING HALT</b>\n"
+            + "<b>" + html.escape(sym) + "</b>" + price_str
+        )
 
 
 # ----------------------------------------------------------------------
