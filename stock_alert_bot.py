@@ -100,6 +100,8 @@ FINNHUB_API_KEY    = _env("FINNHUB_API_KEY")
 PRICE_MIN      = 0.10
 PRICE_MAX      = 20.00
 MAX_MARKET_CAP = 2_000_000_000     # ignore anything bigger than ~$2B
+NEWS_MAX_MARKET_CAP = 500_000_000  # catalyst/news alerts only: skip caps over $500M
+                                   # (Nasdaq reports marketCap in dollars)
 MIN_PERCENT    = 10.0              # regular-hours move threshold
 MIN_VOLUME     = 100000
 MIN_DOLLAR_VOL = 250000
@@ -716,12 +718,16 @@ def tickers_in(text):
 def _news_alert(sym, headline, source, url, tag="NEWS"):
     with _universe_lock:
         info = _universe.get(sym) or {}
+    mcap = info.get("mcap")
+    if mcap is not None and mcap > NEWS_MAX_MARKET_CAP:
+        return False        # too big to be a small-cap catalyst -> skip
     px = info.get("close")
     price_str = ("  $" + format(px, ",.2f")) if px else ""
     send_telegram(
         "\U0001F4F0 <b>" + tag + "</b>  <b>" + html.escape(sym) + "</b>" + price_str + "\n"
         + html.escape(headline[:250])
     )
+    return True
 
 
 def check_market_news():
@@ -745,8 +751,8 @@ def check_market_news():
             for sym in list(syms)[:2]:
                 _catalyst.add(sym)
                 if once(nid + ":" + sym):
-                    _news_alert(sym, headline, str(n.get("source") or ""), url)
-                    found += 1
+                    if _news_alert(sym, headline, str(n.get("source") or ""), url):
+                        found += 1
 
     # --- Source B: free PR wires (where small-cap catalysts break first)
     if feedparser is not None:
@@ -766,8 +772,8 @@ def check_market_news():
                     _catalyst.add(sym)
                     key = "pr:" + (entry.get("id") or link or title)[:120] + ":" + sym
                     if once(key):
-                        _news_alert(sym, title, "PR Wire", link, tag="CATALYST")
-                        found += 1
+                        if _news_alert(sym, title, "PR Wire", link, tag="CATALYST"):
+                            found += 1
 
     if found:
         log.info("News scan: %d new catalyst alerts (%d tickers tracked)",
