@@ -58,6 +58,7 @@ import html
 import logging
 import threading
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 try:
@@ -109,8 +110,9 @@ LOWFLOAT_MAX_M = 50.0              # shares-out (millions) -> "LOW FLOAT" tag
 # --- Extended-hours (premarket / after-hours) filters ---
 PM_MIN_PERCENT   = 20.0            # bigger threshold: extended moves are wilder
 PM_MIN_VOLUME    = 50000           # extended-session share volume floor
-MAX_PM_CANDIDATES = 200            # symbols polled per extended scan
-PM_REQ_GAP       = 0.25            # seconds between extended-quote requests
+EXT_WORKERS      = 20              # concurrent extended-quote fetches
+                                   # (measured: ~43ms/symbol, 0 failures at 12)
+MAX_EXT_ALERTS   = 20              # alerts per sweep (biggest movers first)
 
 # Volume-surge thresholds (WebSocket trades)
 VOL_BUCKET_SEC  = 60
@@ -545,34 +547,38 @@ def fetch_extended(sym, markettype):
 
 def build_candidates():
     """
-    Symbols worth polling in extended hours, highest-signal first:
+    EVERY small-cap symbol -- ordered by priority so that if a sweep gets
+    throttled part-way, the names most likely to run are already covered:
       1. today's catalyst names (news / filings / halts)
       2. names already flagged as runners
-      3. most-active small caps from the last session (fills the remainder)
+      3. everything else, most-liquid first (prior-session dollar volume)
+
+    NOTE: this deliberately returns the FULL universe. An earlier version capped
+    this at 200 symbols by prior-day volume, which silently missed real runners
+    (e.g. WETO +177% premarket on only 88,970 shares the prior session).
     """
     with _universe_lock:
         uni = dict(_universe)
     if not uni:
         return []
-    ordered = []
-    seen = set()
+    ordered, seen = [], set()
     for group in (sorted(_catalyst), sorted(_watchlist)):
         for s in group:
             if s in uni and s not in seen:
                 ordered.append(s)
                 seen.add(s)
-    filler = sorted(uni.items(), key=lambda kv: kv[1].get("vol") or 0, reverse=True)
-    for s, _info in filler:
-        if len(ordered) >= MAX_PM_CANDIDATES:
-            break
+    rest = sorted(uni.items(),
+                  key=lambda kv: (kv[1].get("vol") or 0) * (kv[1].get("close") or 0),
+                  reverse=True)
+    for s, _info in rest:
         if s not in seen:
             ordered.append(s)
             seen.add(s)
-    return ordered[:MAX_PM_CANDIDATES]
+    return ordered
 
 
 def scan_extended():
-    """Premarket / after-hours gap scanner."""
+    """Premarket / after-hours gap scanner across the WHOLE small-cap universe."""
     sess = session()
     if sess not in ("pre", "post"):
         return
@@ -582,25 +588,35 @@ def scan_extended():
         return
 
     label = "PREMARKET" if sess == "pre" else "AFTER-HOURS"
+    t0 = time.time()
+    hits = []
+    fails = 0
+
+    def probe(sym):
+        return sym, fetch_extended(sym, markettype)
+
+    with ThreadPoolExecutor(max_workers=EXT_WORKERS) as pool:
+        for sym, q in pool.map(probe, cands):
+            if not q:
+                fails += 1
+                continue
+            price, pct, vol = q["price"], q["pct"], q["volume"]
+            if price < PRICE_MIN or price > PRICE_MAX:
+                continue
+            if pct < PM_MIN_PERCENT or vol < PM_MIN_VOLUME:
+                continue
+            hits.append((pct, sym, price, vol, q.get("high")))
+
+    hits.sort(key=lambda h: h[0], reverse=True)   # biggest movers alert first
     day = now_et().strftime("%Y%m%d")
-    hits = 0
-    checked = 0
-    for sym in cands:
-        q = fetch_extended(sym, markettype)
-        checked += 1
-        time.sleep(PM_REQ_GAP)
-        if not q:
-            continue
-        price, pct, vol = q["price"], q["pct"], q["volume"]
-        if price < PRICE_MIN or price > PRICE_MAX:
-            continue
-        if pct < PM_MIN_PERCENT or vol < PM_MIN_VOLUME:
-            continue
+    sent = 0
+    for pct, sym, price, vol, high in hits:
+        if sent >= MAX_EXT_ALERTS:
+            break
         # Re-alert only on a materially bigger move (every extra 50%).
         tier = int(pct // 50)
         if not once("ext:" + markettype + ":" + sym + ":" + day + ":" + str(tier)):
             continue
-        high = q.get("high")
         extra = ("\n" + label.title() + " High: $" + format(high, ",.2f")) if high else ""
         send_telegram(
             "\U0001F680 <b>" + label + " RUNNER</b>\n"
@@ -608,9 +624,25 @@ def scan_extended():
             + "  (" + format(pct, "+.1f") + "%)" + extra + "\n"
             + label.title() + " Vol: " + format(int(vol), ",") + lowfloat_tag(sym)
         )
-        hits += 1
-    log.info("%s scan: polled %d candidates -> %d alerts", label, checked, hits)
+        sent += 1
+    log.info("%s sweep: %d symbols in %.0fs -> %d qualifying, %d alerts, %d fetch fails",
+             label, len(cands), time.time() - t0, len(hits), sent, fails)
 
+
+def _extended_loop():
+    """Run the extended-hours sweep on its own thread.
+
+    A full sweep takes ~1-2 minutes, so it must not block the main scheduler
+    (halts run every 20s and would otherwise be delayed behind it).
+    """
+    while True:
+        started = time.time()
+        try:
+            scan_extended()
+        except Exception as e:  # noqa: BLE001
+            log.error("scan_extended failed: %s", e)
+        # Cycle-aware: sleep only the remainder so sweeps land on a steady beat.
+        time.sleep(max(10, INTERVAL_EXTENDED - (time.time() - started)))
 
 # ----------------------------------------------------------------------
 # ALERT 3: MARKET-WIDE NEWS / CATALYSTS
@@ -835,17 +867,18 @@ def main():
 
     t = threading.Thread(target=_ws_run, daemon=True)
     t.start()
+    # Full-universe extended sweep runs on its own thread (it takes ~1-2 min).
+    threading.Thread(target=_extended_loop, daemon=True).start()
 
     schedule = [
         (refresh_universe,   INTERVAL_UNIVERSE),
         (scan_market,        INTERVAL_SCAN),
-        (scan_extended,      INTERVAL_EXTENDED),
         (check_market_news,  INTERVAL_NEWS),
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
     ]
     # Kick off the scanners almost immediately so alerts start flowing.
-    soon = (scan_market, scan_extended, check_market_news)
+    soon = (scan_market, check_market_news)
     next_run = {fn.__name__: time.time() + (3 if fn in soon else interval)
                 for fn, interval in schedule}
     last_saved_n = len(_seen)
