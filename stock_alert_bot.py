@@ -99,9 +99,10 @@ FINNHUB_API_KEY    = _env("FINNHUB_API_KEY")
 # --- Small-cap universe / regular-session filters ---
 PRICE_MIN      = 0.10
 PRICE_MAX      = 20.00
-MAX_MARKET_CAP = 2_000_000_000     # ignore anything bigger than ~$2B
-NEWS_MAX_MARKET_CAP = 500_000_000  # catalyst/news alerts only: skip caps over $500M
-                                   # (Nasdaq reports marketCap in dollars)
+MAX_MARKET_CAP = 500_000_000       # FLEET-WIDE cap: no alert of any type fires for a
+                                   # company bigger than this. Nasdaq reports
+                                   # marketCap in dollars (Ford = 56,499,026,300).
+                                   # Symbols with no cap data are allowed through.
 MIN_PERCENT    = 10.0              # regular-hours move threshold
 MIN_VOLUME     = 100000
 MIN_DOLLAR_VOL = 250000
@@ -235,6 +236,11 @@ _silent = False
 # Small-cap universe: symbol -> {"close": float, "mcap": float, "name": str, "vol": float}
 _universe = {}
 _universe_lock = threading.Lock()
+
+# Market cap for EVERY symbol on the screener (not just the small-cap universe),
+# so the fleet-wide cap can be enforced on halts/news for names that fall outside
+# the price band. Guarded by _universe_lock.
+_mcap_all = {}
 
 # Tickers with a catalyst today (news/filing/halt) -> priority premarket candidates.
 _catalyst = set()
@@ -381,6 +387,17 @@ def shares_out_millions(sym):
     return val
 
 
+def too_big(sym):
+    """Fleet-wide gate: True if this company exceeds MAX_MARKET_CAP.
+
+    Symbols with no market-cap data are NOT filtered -- those are almost always
+    obscure micro-caps, and silently dropping them would defeat the purpose.
+    """
+    with _universe_lock:
+        mc = _mcap_all.get(sym)
+    return mc is not None and mc > MAX_MARKET_CAP
+
+
 def current_price(sym):
     """Best-effort live price: WS last trade -> Nasdaq real-time quote -> prior close."""
     with _vol_lock:
@@ -431,16 +448,21 @@ def refresh_universe():
         return
 
     uni = {}
+    caps = {}
     for row in rows:
         sym = (row.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        mcap = _num(row.get("marketCap"))
+        if mcap is not None:
+            caps[sym] = mcap        # recorded for EVERY symbol, price-band or not
         price = _num(row.get("lastsale"))
-        if not sym or price is None:
+        if price is None:
             continue
         if "^" in sym or "/" in sym or "." in sym:
             continue
         if price < PRICE_MIN or price > PRICE_MAX:
             continue
-        mcap = _num(row.get("marketCap"))
         if mcap is not None and mcap > MAX_MARKET_CAP:
             continue
         uni[sym] = {
@@ -452,7 +474,10 @@ def refresh_universe():
     with _universe_lock:
         _universe.clear()
         _universe.update(uni)
-    log.info("Universe: %d rows -> %d small-cap symbols", len(rows), len(uni))
+        _mcap_all.clear()
+        _mcap_all.update(caps)
+    log.info("Universe: %d rows -> %d symbols under $%s cap (%d caps known)",
+             len(rows), len(uni), format(MAX_MARKET_CAP, ","), len(caps))
 
 
 # ----------------------------------------------------------------------
@@ -493,6 +518,9 @@ def discover_movers():
         if pct < MIN_PERCENT:
             continue
         if vol < MIN_VOLUME or (price * vol) < MIN_DOLLAR_VOL:
+            continue
+        mcap = _num(row.get("marketCap"))
+        if mcap is not None and mcap > MAX_MARKET_CAP:
             continue
         out.append({"symbol": sym, "price": price, "pct": pct, "volume": vol})
 
@@ -716,11 +744,10 @@ def tickers_in(text):
 
 
 def _news_alert(sym, headline, source, url, tag="NEWS"):
+    if too_big(sym):        # fleet-wide market-cap gate
+        return False
     with _universe_lock:
         info = _universe.get(sym) or {}
-    mcap = info.get("mcap")
-    if mcap is not None and mcap > NEWS_MAX_MARKET_CAP:
-        return False        # too big to be a small-cap catalyst -> skip
     px = info.get("close")
     price_str = ("  $" + format(px, ",.2f")) if px else ""
     send_telegram(
@@ -802,6 +829,8 @@ def check_halts():
         sym = (entry.get("ndaq_issuesymbol")
                or entry.get("title", "")).strip().upper()
         if not sym or not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,7}", sym):
+            continue
+        if too_big(sym):              # fleet-wide market-cap gate
             continue
         _catalyst.add(sym)            # halted names are prime premarket candidates
         px = current_price(sym)
