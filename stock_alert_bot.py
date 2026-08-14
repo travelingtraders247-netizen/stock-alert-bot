@@ -152,6 +152,40 @@ PR_FEEDS = [
     "https://www.prnewswire.com/rss/news-releases-list.rss",
 ]
 
+# Nasdaq / UTP halt reason codes -> plain English. Unmapped codes show as-is.
+# The distinction matters: LUDP/T5 usually resume quickly, T1 (news pending)
+# and the H-series (compliance) are far more serious.
+HALT_REASONS = {
+    "T1": "News Pending",
+    "T2": "News Released",
+    "T5": "Volatility Pause",
+    "T6": "Extraordinary Market Activity",
+    "T7": "Correction of a Transaction",
+    "T8": "ETF Component Halt",
+    "T12": "Additional Information Requested",
+    "H4": "Non-Compliance",
+    "H9": "Filings Not Current",
+    "H10": "SEC Trading Suspension",
+    "H11": "Regulatory Concern",
+    "IPO1": "IPO Not Yet Trading",
+    "IPOQ": "IPO Quote Period",
+    "LUDP": "Volatility Pause (Limit Up/Down)",
+    "LUDS": "Volatility Pause - Straddle",
+    "MWC0": "Market-Wide Circuit Breaker",
+    "MWC1": "Market-Wide Circuit Breaker L1",
+    "MWC2": "Market-Wide Circuit Breaker L2",
+    "MWC3": "Market-Wide Circuit Breaker L3",
+    "M": "Volatility Pause",
+    "D": "News Dissemination",
+    "R1": "New Issue Available",
+    "R4": "Qualifications Issues Resolved",
+    "R9": "Filings Complete",
+    "C3": "Issuer News Not Forthcoming",
+    "C4": "Qualifications Halt Ended",
+    "C9": "Filings Complete",
+    "C11": "Trade Correction",
+}
+
 DRY_RUN = "--test" in sys.argv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -766,9 +800,14 @@ def check_halts():
         _catalyst.add(sym)            # halted names are prime premarket candidates
         px = current_price(sym)
         price_str = ("  $" + format(px, ",.2f")) if px else ""
+        code = (entry.get("ndaq_reasoncode") or "").strip().upper()
+        reason = ""
+        if code:
+            desc = HALT_REASONS.get(code)
+            reason = "\n" + html.escape(code + (" - " + desc if desc else ""))
         send_telegram(
             "\U0001F6A8 <b>TRADING HALT</b>\n"
-            + "<b>" + html.escape(sym) + "</b>" + price_str
+            + "<b>" + html.escape(sym) + "</b>" + price_str + reason
         )
 
 
