@@ -189,6 +189,12 @@ HALT_REASONS = {
     "C11": "Trade Correction",
 }
 
+# Catalyst/news throttle. Article-level de-dup can't stop the same story arriving
+# from Finnhub + GlobeNewswire + PRNewswire under three different ids, so cap how
+# often any one ticker can produce a catalyst alert in a rolling window.
+NEWS_MAX_PER_24H = 2
+NEWS_WINDOW_SEC  = 86400
+
 DRY_RUN = "--test" in sys.argv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -196,6 +202,9 @@ log = logging.getLogger("alertbot")
 
 # De-dup memory so the same event isn't posted twice.
 _seen = set()
+
+# symbol -> [epoch timestamps of catalyst alerts] for the rolling 24h throttle.
+_news_hist = defaultdict(list)
 
 # Optional on-disk de-dup so a redeploy doesn't re-post the same alerts.
 SEEN_PATH = (_env("DEDUP_PATH")
@@ -214,14 +223,29 @@ def _load_seen():
         log.info("Loaded %d de-dup keys from %s", len(_seen), SEEN_PATH)
     else:
         log.info("De-dup file is from another day; starting fresh today.")
+    # The news throttle is a rolling 24h window, so restore it regardless of the
+    # calendar date and just drop anything already outside the window.
+    cutoff = time.time() - NEWS_WINDOW_SEC
+    restored = 0
+    for sym, stamps in (blob.get("news_hist") or {}).items():
+        keep = [t for t in stamps if t >= cutoff]
+        if keep:
+            _news_hist[sym] = keep
+            restored += 1
+    if restored:
+        log.info("Restored 24h news throttle for %d tickers", restored)
 
 
 def _save_seen():
     """Atomically write the current de-dup set (with today's date) to disk."""
     try:
         tmp = SEEN_PATH + ".tmp"
+        cutoff = time.time() - NEWS_WINDOW_SEC
+        hist = {s: [t for t in ts if t >= cutoff] for s, ts in _news_hist.items()}
+        hist = {s: ts for s, ts in hist.items() if ts}
         with open(tmp, "w") as f:
-            json.dump({"date": time.strftime("%Y%m%d"), "seen": sorted(_seen)}, f)
+            json.dump({"date": time.strftime("%Y%m%d"), "seen": sorted(_seen),
+                       "news_hist": hist}, f)
         os.replace(tmp, SEEN_PATH)
     except OSError as e:
         log.warning("Could not save de-dup file (%s): %s", SEEN_PATH, e)
@@ -746,6 +770,13 @@ def tickers_in(text):
 def _news_alert(sym, headline, source, url, tag="NEWS"):
     if too_big(sym):        # fleet-wide market-cap gate
         return False
+    # Rolling 24h throttle: the same story reaches us from several wires under
+    # different ids, so cap catalyst alerts per ticker regardless of source.
+    now_ts = time.time()
+    hist = [t for t in _news_hist.get(sym, []) if now_ts - t < NEWS_WINDOW_SEC]
+    if len(hist) >= NEWS_MAX_PER_24H:
+        _news_hist[sym] = hist
+        return False
     with _universe_lock:
         info = _universe.get(sym) or {}
     px = info.get("close")
@@ -754,6 +785,8 @@ def _news_alert(sym, headline, source, url, tag="NEWS"):
         "\U0001F4F0 <b>" + tag + "</b>  <b>" + html.escape(sym) + "</b>" + price_str + "\n"
         + html.escape(headline[:250])
     )
+    hist.append(now_ts)
+    _news_hist[sym] = hist
     return True
 
 
