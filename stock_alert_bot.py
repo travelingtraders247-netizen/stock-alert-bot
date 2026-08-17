@@ -911,6 +911,21 @@ def check_market_news():
 # ----------------------------------------------------------------------
 # ALERT 4: TRADING HALTS
 # ----------------------------------------------------------------------
+def _resume_epoch(rdate, rtime):
+    """'08/17/2026' + '14:36:10.093' (ET) -> epoch seconds, or None."""
+    try:
+        dt = datetime.strptime(rdate.strip() + " " + rtime.strip().split(".")[0],
+                               "%m/%d/%Y %H:%M:%S")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if ET is not None:
+        dt = dt.replace(tzinfo=ET)
+    try:
+        return dt.timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
 def check_halts():
     if feedparser is None:
         return
@@ -933,6 +948,23 @@ def check_halts():
         # timestamp instead so each pause is its own event.
         stamp = ((entry.get("ndaq_haltdate") or "") + " "
                  + (entry.get("ndaq_halttime") or "")).strip()
+        # RESUMPTION: the same feed item later gains a ResumptionTradeTime. This
+        # runs on every poll (before the halt de-dup below, which would `continue`
+        # past it) so a halt we already announced can still report its reopen.
+        rdate = (entry.get("ndaq_resumptiondate") or "").strip()
+        rtime = (entry.get("ndaq_resumptiontradetime") or "").strip()
+        if rdate and rtime:
+            rts = _resume_epoch(rdate, rtime)
+            if rts is not None and time.time() >= rts:
+                if once("resume:" + sym + ":" + stamp) and not _silent:
+                    if not too_big(sym):
+                        rpx = current_price(sym)
+                        rstr = ("  $" + format(rpx, ",.2f")) if rpx else ""
+                        send_telegram(
+                            "\u25b6\ufe0f <b>RESUMED</b>\n"
+                            + "<b>" + html.escape(sym) + "</b>" + rstr
+                        )
+
         eid = "halt:" + sym + ":" + (stamp or entry.get("id")
                                      or entry.get("link") or "")
         if not once(eid):
