@@ -757,6 +757,72 @@ def _extended_loop():
 # ----------------------------------------------------------------------
 _TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
 
+# --- English-only gate for catalyst/news headlines -------------------------
+# Any non-Latin script is an immediate reject.
+_NON_LATIN_RE = re.compile(
+    "["
+    "\u0400-\u04ff"    # Cyrillic
+    "\u0590-\u05ff"    # Hebrew
+    "\u0600-\u06ff"    # Arabic
+    "\u0370-\u03ff"    # Greek
+    "\u0e00-\u0e7f"    # Thai
+    "\u0900-\u097f"    # Devanagari
+    "\u3040-\u30ff"    # Japanese kana
+    "\u4e00-\u9fff"    # CJK
+    "\uac00-\ud7af"    # Hangul
+    "]"
+)
+_ACCENT_RE = re.compile("[\u00e0-\u00ff]")
+_WORD_RE = re.compile("[A-Za-z\u00c0-\u00ff']+")
+
+_FOREIGN_WORDS = {
+    # Spanish / Portuguese
+    "anuncia", "anuncio", "acuerdo", "para", "con", "del", "los", "las", "una",
+    "por", "sus", "empresa", "mercado", "millones", "segun", "tambien", "mas",
+    "nao", "com", "apos", "sobre", "sera", "esta", "sao", "dos", "das", "pela",
+    "pelo", "um", "uma", "su", "sistema", "de", "el", "en", "que", "ano",
+    # French
+    "societe", "avec", "pour", "dans", "sur", "les", "des", "une", "aux", "est",
+    "son", "resultats", "annonce", "ete", "leur", "cette", "ses",
+    # German
+    "und", "der", "die", "das", "fuer", "mit", "von", "bei", "auf", "eine",
+    "einen", "wird", "aktie", "millionen", "geschaeftsjahr", "quartal", "nicht",
+    # Italian
+    "della", "dello", "degli", "nel", "gli", "sono", "anche", "societa",
+}
+_ENGLISH_WORDS = {
+    "the", "and", "of", "to", "in", "for", "on", "with", "announces", "announced",
+    "reports", "is", "at", "its", "from", "new", "first", "second", "third",
+    "fourth", "quarter", "results", "company", "shares", "will", "has", "have",
+    "by", "as", "that", "after", "said", "says", "million", "billion", "stock",
+    "agreement", "completes", "receives", "launches", "expands", "signs", "into",
+    "up", "over", "market", "board", "chief", "officer", "inc", "corp",
+}
+
+
+def is_english(text):
+    """Heuristic: keep only English-looking headlines (no translation, just a gate).
+
+    Deliberately conservative -- an English headline containing one accented
+    proper noun still passes; it takes a majority of foreign function words, or a
+    non-Latin script, to reject.
+    """
+    if not text:
+        return True
+    if _NON_LATIN_RE.search(text):
+        return False
+    words = [w.lower() for w in _WORD_RE.findall(text)]
+    if not words:
+        return True
+    foreign = sum(1 for w in words if w in _FOREIGN_WORDS)
+    english = sum(1 for w in words if w in _ENGLISH_WORDS)
+    if foreign > english:
+        return False
+    # Heavy accent use with zero English function words -> not English.
+    if english == 0 and len(_ACCENT_RE.findall(text.lower())) >= 2:
+        return False
+    return True
+
 
 def tickers_in(text):
     """Uppercase tokens in text that are real symbols in our small-cap universe."""
@@ -769,6 +835,8 @@ def tickers_in(text):
 
 def _news_alert(sym, headline, source, url, tag="NEWS"):
     if too_big(sym):        # fleet-wide market-cap gate
+        return False
+    if not is_english(headline):    # English-only channel
         return False
     # Rolling 24h throttle: the same story reaches us from several wires under
     # different ids, so cap catalyst alerts per ticker regardless of source.
