@@ -920,17 +920,25 @@ def check_halts():
         log.error("Halt feed error: %s", e)
         return
     for entry in feed.entries:
-        eid = entry.get("id") or entry.get("link") or entry.get("title", "")
-        if not eid or not once("halt:" + eid):
-            continue
-        if _silent:
-            continue        # priming a redeploy: record the id, don't fetch or send
         # The feed's <title> is just the ticker (e.g. "NIPG"). Its <description>
         # is a raw HTML table -- deliberately ignored so it never hits the channel.
         sym = (entry.get("ndaq_issuesymbol")
                or entry.get("title", "")).strip().upper()
         if not sym or not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,7}", sym):
             continue
+        # Nasdaq's halt items carry NO <guid> and NO <link>, so feedparser falls
+        # back to <title> -- which is just the ticker. Keying off that collapses
+        # every halt of a symbol into one entry, so only the first of the day ever
+        # alerted (WETO halted 7x in one session and we sent one). Key on the halt
+        # timestamp instead so each pause is its own event.
+        stamp = ((entry.get("ndaq_haltdate") or "") + " "
+                 + (entry.get("ndaq_halttime") or "")).strip()
+        eid = "halt:" + sym + ":" + (stamp or entry.get("id")
+                                     or entry.get("link") or "")
+        if not once(eid):
+            continue
+        if _silent:
+            continue        # priming a redeploy: record the id, don't fetch or send
         if too_big(sym):              # fleet-wide market-cap gate
             continue
         _catalyst.add(sym)            # halted names are prime premarket candidates
