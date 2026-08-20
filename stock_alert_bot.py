@@ -195,6 +195,11 @@ HALT_REASONS = {
 NEWS_MAX_PER_24H = 2
 NEWS_WINDOW_SEC  = 86400
 
+# Never block the scheduler for more than this on a Telegram rate-limit, and emit
+# a heartbeat so a silent stall is obvious in the logs.
+MAX_TG_SLEEP     = 60
+HEARTBEAT_SEC    = 900
+
 DRY_RUN = "--test" in sys.argv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -342,8 +347,13 @@ def send_telegram(text):
                     retry = int(r.json()["parameters"]["retry_after"])
                 except (ValueError, KeyError, TypeError):
                     pass
-                log.warning("Telegram 429; sleeping %ss then retrying", retry)
-                time.sleep(retry + 1)
+                # Cap the wait: Telegram can hand back a retry_after of many
+                # minutes, and sleeping that long here stalls the whole scheduler
+                # because this runs on the main thread holding _send_lock.
+                nap = min(retry, MAX_TG_SLEEP)
+                log.warning("Telegram 429; sleeping %ss (asked %ss) then retrying",
+                            nap, retry)
+                time.sleep(nap + 1)
                 continue
             if r.status_code != 200:
                 log.error("Telegram error %s: %s", r.status_code, r.text[:200])
@@ -1127,8 +1137,24 @@ def main():
     next_run = {fn.__name__: time.time() + (3 if fn in soon else interval)
                 for fn, interval in schedule}
     last_saved_n = len(_seen)
+    cur_day = now_et().strftime("%Y%m%d")
+    last_beat = time.time()
 
     while True:
+        # New trading day: drop yesterday's de-dup keys. Without this the set
+        # grows for the life of the process (it was only ever reset on restart).
+        today = now_et().strftime("%Y%m%d")
+        if today != cur_day:
+            _seen.clear()
+            cur_day = today
+            last_saved_n = 0
+            log.info("New trading day %s: cleared de-dup memory", today)
+        # Heartbeat -- if these stop, the loop is wedged.
+        if time.time() - last_beat >= HEARTBEAT_SEC:
+            log.info("heartbeat: session=%s seen=%d watchlist=%d catalysts=%d",
+                     session(), len(_seen), len(_watchlist), len(_catalyst))
+            last_beat = time.time()
+
         now = time.time()
         for fn, interval in schedule:
             if now >= next_run[fn.__name__]:
