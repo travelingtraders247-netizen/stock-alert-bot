@@ -735,12 +735,12 @@ def scan_extended():
         tier = int(pct // 50)
         if not once("ext:" + markettype + ":" + sym + ":" + day + ":" + str(tier)):
             continue
-        extra = ("\n" + label.title() + " High: $" + format(high, ",.2f")) if high else ""
+        # Minimal extended-hours format: ticker, price, chart emoji. No percent,
+        # no session high, no volume, no low-float tag.
         send_telegram(
             "\U0001F680 <b>" + label + " RUNNER</b>\n"
             + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
-            + "  (" + format(pct, "+.1f") + "%)" + extra + "\n"
-            + label.title() + " Vol: " + format(int(vol), ",") + lowfloat_tag(sym)
+            + " \U0001F4C8"
         )
         sent += 1
     log.info("%s sweep: %d symbols in %.0fs -> %d qualifying, %d alerts, %d fetch fails",
