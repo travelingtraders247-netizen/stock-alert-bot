@@ -68,6 +68,17 @@ except Exception:  # noqa: BLE001 - fall back to UTC-ish if tzdata missing
     ET = None
 
 import requests
+from requests.adapters import HTTPAdapter
+
+# Shared, pooled HTTP session. The premarket sweep makes thousands of requests
+# per pass; with a bare requests.get() each one opened a brand-new TCP socket,
+# which exhausted file descriptors and silently wedged the whole process
+# mid-session (it died twice this way). A pooled Session reuses connections and
+# bounds the socket count.
+_http = requests.Session()
+_adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=0)
+_http.mount("https://", _adapter)
+_http.mount("http://", _adapter)
 
 try:
     import feedparser  # halt RSS + PR wire feeds
@@ -113,7 +124,7 @@ LOWFLOAT_MAX_M = 50.0              # shares-out (millions) -> "LOW FLOAT" tag
 # --- Extended-hours (premarket / after-hours) filters ---
 PM_MIN_PERCENT   = 20.0            # bigger threshold: extended moves are wilder
 PM_MIN_VOLUME    = 50000           # extended-session share volume floor
-EXT_WORKERS      = 20              # concurrent extended-quote fetches
+EXT_WORKERS      = 10              # concurrent extended-quote fetches (pooled)
                                    # (measured: ~43ms/symbol, 0 failures at 12)
 MAX_EXT_ALERTS   = 20              # alerts per sweep (biggest movers first)
 
@@ -649,18 +660,24 @@ def parse_extended(payload):
 
 
 def fetch_extended(sym, markettype):
-    """Fetch one symbol's extended-hours quote. Returns parsed dict or None."""
+    """One symbol's extended-hours quote.
+
+    Returns a dict on success, "ERR" on an HTTP/transport failure, or None when
+    the symbol simply has no extended-hours trades (the common case -- most small
+    caps never print premarket). Callers must count those two apart: lumping them
+    together made a normal quiet market look like a 72% failure rate.
+    """
     url = NASDAQ_EXTENDED.format(sym=sym, mt=markettype)
     try:
-        r = requests.get(url, headers=NASDAQ_HEADERS, timeout=12)
+        r = _http.get(url, headers=NASDAQ_HEADERS, timeout=12)
     except requests.RequestException:
-        return None
+        return "ERR"
     if r.status_code != 200:
-        return None
+        return "ERR"
     try:
         return parse_extended(r.json())
     except ValueError:
-        return None
+        return "ERR"
 
 
 def build_candidates():
@@ -713,10 +730,14 @@ def scan_extended():
     def probe(sym):
         return sym, fetch_extended(sym, markettype)
 
+    errors = 0
     with ThreadPoolExecutor(max_workers=EXT_WORKERS) as pool:
         for sym, q in pool.map(probe, cands):
+            if q == "ERR":
+                errors += 1
+                continue
             if not q:
-                fails += 1
+                fails += 1          # no extended-hours trades: normal and expected
                 continue
             price, pct, vol = q["price"], q["pct"], q["volume"]
             if price < PRICE_MIN or price > PRICE_MAX:
@@ -743,8 +764,12 @@ def scan_extended():
             + " \U0001F4C8"
         )
         sent += 1
-    log.info("%s sweep: %d symbols in %.0fs -> %d qualifying, %d alerts, %d fetch fails",
-             label, len(cands), time.time() - t0, len(hits), sent, fails)
+    log.info("%s sweep: %d symbols in %.0fs -> %d qualifying, %d alerts "
+             "(%d no-premarket-trades, %d http errors)",
+             label, len(cands), time.time() - t0, len(hits), sent, fails, errors)
+    if errors > len(cands) * 0.2:
+        log.warning("%s sweep: %d/%d requests errored -- Nasdaq may be throttling",
+                    label, errors, len(cands))
 
 
 def _extended_loop():
