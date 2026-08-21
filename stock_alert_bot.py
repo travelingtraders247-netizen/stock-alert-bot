@@ -211,6 +211,14 @@ NEWS_WINDOW_SEC  = 86400
 MAX_TG_SLEEP     = 60
 HEARTBEAT_SEC    = 900
 
+# Watchdog. This process has silently wedged several times -- alive enough that
+# Railway still reported "ACTIVE", but the scheduler loop stopped ticking and no
+# alerts went out for hours. Rather than keep guessing at the cause, fail fast:
+# if the main loop stops ticking, kill the process so Railway's "restart on
+# failure" policy brings it straight back.
+WATCHDOG_TIMEOUT = 600
+_last_tick = [time.time()]
+
 DRY_RUN = "--test" in sys.argv
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -772,6 +780,25 @@ def scan_extended():
                     label, errors, len(cands))
 
 
+def _watchdog():
+    """Kill the process if the main scheduler loop stops ticking.
+
+    Exiting non-zero triggers Railway's restart-on-failure policy, so a wedge
+    costs ~10 minutes of downtime instead of silently lasting all day.
+    """
+    while True:
+        time.sleep(60)
+        stalled = time.time() - _last_tick[0]
+        if stalled > WATCHDOG_TIMEOUT:
+            log.critical("WATCHDOG: main loop stalled %.0fs -- exiting for restart",
+                         stalled)
+            try:
+                sys.stderr.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            os._exit(1)
+
+
 def _extended_loop():
     """Run the extended-hours sweep on its own thread.
 
@@ -1165,7 +1192,10 @@ def main():
     cur_day = now_et().strftime("%Y%m%d")
     last_beat = time.time()
 
+    threading.Thread(target=_watchdog, daemon=True).start()
+
     while True:
+        _last_tick[0] = time.time()     # watchdog liveness
         # New trading day: drop yesterday's de-dup keys. Without this the set
         # grows for the life of the process (it was only ever reset on restart).
         today = now_et().strftime("%Y%m%d")
