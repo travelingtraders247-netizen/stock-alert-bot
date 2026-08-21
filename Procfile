@@ -1,1 +1,1 @@
-worker: python stock_alert_bot.py
+worker: python -u stock_alert_bot.py
