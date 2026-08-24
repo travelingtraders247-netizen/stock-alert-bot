@@ -524,11 +524,31 @@ def refresh_universe():
             "name": (row.get("name") or "").strip(),
             "vol": _num(row.get("volume")) or 0.0,
         }
+    # Company-name -> ticker index, so a PR headline that says "Expion" or
+    # "Reitar Logtech" (and never prints the symbol) can still be matched.
+    nidx, npre = {}, {}
+    dupes = set()
+    for sym, info in uni.items():
+        key = _name_key(info.get("name"))
+        if not key:
+            continue
+        if key in nidx and nidx[key] != sym:
+            dupes.add(key)                # ambiguous name -> unusable
+            continue
+        nidx[key] = sym
+        npre.setdefault(key[:5], []).append((key, sym))
+    for k in dupes:
+        nidx.pop(k, None)
+
     with _universe_lock:
         _universe.clear()
         _universe.update(uni)
         _mcap_all.clear()
         _mcap_all.update(caps)
+        _name_index.clear()
+        _name_index.update(nidx)
+        _name_prefix.clear()
+        _name_prefix.update(npre)
     log.info("Universe: %d rows -> %d symbols under $%s cap (%d caps known)",
              len(rows), len(uni), format(MAX_MARKET_CAP, ","), len(caps))
 
@@ -886,6 +906,78 @@ def is_english(text):
     return True
 
 
+# PR wires tag each release with the listing, e.g. <category>Nasdaq:ENGS</category>.
+# The headline itself almost never contains the symbol -- it leads with the company
+# name -- so the category tag is the reliable place to find the ticker.
+_EXCH_TICKER_RE = re.compile(
+    r"(?:NASDAQ|NYSE\s*AMERICAN|NYSEAMERICAN|NYSE|AMEX|CBOE|OTCQB|OTCQX|OTC)"
+    r"\s*:\s*([A-Z][A-Z0-9]{0,5})", re.I)
+
+# Generic words that must never be treated as a company's distinctive name.
+_NAME_STOP = {
+    "the", "and", "for", "inc", "corp", "ltd", "plc", "llc", "co", "group",
+    "holdings", "holding", "company", "american", "global", "national", "first",
+    "international", "technologies", "technology", "industries", "systems",
+    "solutions", "capital", "financial", "enterprises", "pharmaceuticals",
+    "pharma", "therapeutics", "energy", "resources", "partners", "trust", "fund",
+    "acquisition", "limited", "common", "stock", "shares", "ordinary", "class",
+    "depositary", "sciences", "biosciences", "medical", "health", "healthcare",
+    "united", "general", "standard", "premier", "advanced", "digital", "data",
+}
+
+_name_index = {}    # distinctive first token -> symbol (unique matches only)
+_name_prefix = {}   # first 5 chars -> [(token, symbol)] for prefix matching
+
+
+def _name_key(name):
+    """First distinctive token of a company name, or None."""
+    for tok in re.findall(r"[a-z0-9]+", (name or "").lower()):
+        if len(tok) >= 5 and tok not in _NAME_STOP:
+            return tok
+    return None
+
+
+def companies_in(text):
+    """Symbols whose COMPANY NAME appears in the text.
+
+    Press releases say "Expion Acquires..." or "Reitar Logtech forms...", never
+    "XPON" or "RITR". Matching on names is what turns those into alerts. Prefix
+    matching both ways handles "Expion" vs the listed name "Expion360".
+    """
+    if not text:
+        return set()
+    with _universe_lock:
+        idx = _name_index
+        pre = _name_prefix
+        if not idx:
+            return set()
+        out = set()
+        for tok in {t for t in re.findall(r"[a-z0-9]+", text.lower()) if len(t) >= 5}:
+            sym = idx.get(tok)
+            if sym:
+                out.add(sym)
+                continue
+            cands = [s for k, s in pre.get(tok[:5], [])
+                     if k.startswith(tok) or tok.startswith(k)]
+            if len(set(cands)) == 1:      # ambiguous prefixes are dropped
+                out.add(cands[0])
+        return out
+
+
+def tickers_from_entry(entry):
+    """Tickers for an RSS item: category tags first, then any Exchange:SYM in text."""
+    found = set()
+    for tag in (entry.get("tags") or []):
+        term = tag.get("term", "") if isinstance(tag, dict) else str(tag)
+        for m in _EXCH_TICKER_RE.finditer(term or ""):
+            found.add(m.group(1).upper())
+    blob = (entry.get("title", "") or "") + " " + (entry.get("summary", "") or "")
+    for m in _EXCH_TICKER_RE.finditer(blob):
+        found.add(m.group(1).upper())
+    with _universe_lock:
+        return {t for t in found if t in _universe}
+
+
 def tickers_in(text):
     """Uppercase tokens in text that are real symbols in our small-cap universe."""
     if not text:
@@ -935,7 +1027,8 @@ def check_market_news():
             nid = "news:" + str(n.get("id") or url)
             headline = str(n.get("headline") or "")
             related = str(n.get("related") or "")
-            syms = tickers_in(related) or tickers_in(headline)
+            syms = (tickers_in(related) or tickers_in(headline)
+                    or companies_in(headline))
             if not syms:
                 continue
             for sym in list(syms)[:2]:
@@ -955,7 +1048,10 @@ def check_market_news():
             for entry in getattr(feed, "entries", [])[:40]:
                 title = entry.get("title", "")
                 link = entry.get("link", "")
-                syms = tickers_in(title)
+                # category tag (Nasdaq:XPON) -> Exchange:SYM in text -> company name
+                syms = (tickers_from_entry(entry)
+                        or tickers_in(title)
+                        or companies_in(title))
                 if not syms:
                     continue
                 for sym in list(syms)[:2]:
