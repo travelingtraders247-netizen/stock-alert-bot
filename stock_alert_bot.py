@@ -124,7 +124,7 @@ LOWFLOAT_MAX_M = 50.0              # shares-out (millions) -> "LOW FLOAT" tag
 # --- Extended-hours (premarket / after-hours) filters ---
 PM_MIN_PERCENT   = 20.0            # bigger threshold: extended moves are wilder
 PM_MIN_VOLUME    = 50000           # extended-session share volume floor
-EXT_WORKERS      = 10              # concurrent extended-quote fetches (pooled)
+EXT_WORKERS      = 5               # concurrent extended fetches (trial-plan safe)
                                    # (measured: ~43ms/symbol, 0 failures at 12)
 MAX_EXT_ALERTS   = 20              # alerts per sweep (biggest movers first)
 
@@ -137,7 +137,7 @@ VOL_MIN_SHARES  = 5000
 
 # Poll intervals (seconds)
 INTERVAL_SCAN     = 60
-INTERVAL_EXTENDED = 120
+INTERVAL_EXTENDED = 300
 INTERVAL_UNIVERSE = 600
 INTERVAL_HALTS    = 20
 INTERVAL_NEWS     = 120
