@@ -141,6 +141,7 @@ INTERVAL_EXTENDED = 300
 INTERVAL_UNIVERSE = 600
 INTERVAL_HALTS    = 20
 INTERVAL_NEWS     = 120
+INTERVAL_MOVER_NEWS = 300
 INTERVAL_VOLROLL  = VOL_BUCKET_SEC
 
 NASDAQ_HALT_RSS = "http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
@@ -164,7 +165,13 @@ FINNHUB_WS   = "wss://ws.finnhub.io?token="
 PR_FEEDS = [
     "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire-News-about-Public-Companies",
     "https://www.prnewswire.com/rss/news-releases-list.rss",
+    "https://www.prnewswire.com/rss/financial-services-latest-news/financial-services-latest-news-list.rss",
 ]
+# NOTE: each wire feed only exposes ~20 recent items and is mostly noise
+# (European regulatory filings, consumer PR), so a small-cap release can scroll
+# off before we see it. ACCESSWIRE's public feed is dead and Business Wire's
+# broad feeds are a paid media-partner product. check_mover_news() closes that
+# gap from the other direction.
 
 # Nasdaq / UTP halt reason codes -> plain English. Unmapped codes show as-is.
 # The distinction matters: LUDP/T5 usually resume quickly, T1 (news pending)
@@ -1066,6 +1073,40 @@ def check_market_news():
                  found, len(_catalyst))
 
 
+def check_mover_news():
+    """Pull catalysts for stocks the scanner has ALREADY flagged as moving.
+
+    The public wires cap at ~20 items and drop most small-cap releases, so a
+    catalyst like "Expion Acquires..." or "Reitar Logtech forms JV" can never
+    reach us that way. Every runner we detect gets its company news fetched
+    directly from Finnhub instead -- if a stock is up 30%+ there is almost
+    always a release behind it, and this surfaces it.
+    """
+    with _watch_lock:
+        syms = sorted(_watchlist)[:25]
+    if not syms:
+        return
+    today = now_et().strftime("%Y-%m-%d")
+    found = 0
+    for sym in syms:
+        items = finnhub_get("company-news",
+                            {"symbol": sym, "from": today, "to": today})
+        if not isinstance(items, list):
+            continue
+        for n in items[:3]:
+            url = n.get("url") or ""
+            headline = str(n.get("headline") or "")
+            nid = "mnews:" + sym + ":" + str(n.get("id") or url)
+            if not headline or not once(nid):
+                continue
+            if _news_alert(sym, headline, str(n.get("source") or ""), url,
+                           tag="CATALYST"):
+                found += 1
+        time.sleep(0.3)             # stay under Finnhub 60 calls/min
+    if found:
+        log.info("Mover-news: %d catalyst alerts across %d movers", found, len(syms))
+
+
 # ----------------------------------------------------------------------
 # ALERT 4: TRADING HALTS
 # ----------------------------------------------------------------------
@@ -1277,6 +1318,7 @@ def main():
         (refresh_universe,   INTERVAL_UNIVERSE),
         (scan_market,        INTERVAL_SCAN),
         (check_market_news,  INTERVAL_NEWS),
+        (check_mover_news,   INTERVAL_MOVER_NEWS),
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
     ]
