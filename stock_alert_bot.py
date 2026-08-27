@@ -59,7 +59,7 @@ import logging
 import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from zoneinfo import ZoneInfo
@@ -115,6 +115,15 @@ MAX_MARKET_CAP = 500_000_000       # FLEET-WIDE cap: no alert of any type fires 
                                    # marketCap in dollars (Ford = 56,499,026,300).
                                    # Symbols with no cap data are allowed through.
 MIN_PERCENT    = 10.0              # regular-hours move threshold
+
+# --- Unusual-volume (relative volume) detection ---
+# A gain-only scanner is blind to accumulation days. AMIX traded 132x its normal
+# volume on 08/24 while closing only +1.9% -- invisible to us -- and ran +86%
+# intraday the very next session. This catches that setup.
+RVOL_MIN         = 5.0             # today's volume vs prior median
+RVOL_MIN_SHARES  = 750_000         # ignore thin names spiking off a tiny base
+RVOL_MIN_DOLLAR  = 1_000_000
+RVOL_LOOKUPS_MAX = 15              # new baseline fetches per scan (rate control)
 MIN_VOLUME     = 100000
 MIN_DOLLAR_VOL = 250000
 TOP_N_ALERTS   = 15
@@ -158,6 +167,8 @@ NASDAQ_HEADERS = {
     "Referer": "https://www.nasdaq.com/",
 }
 NASDAQ_QUOTE    = "https://api.nasdaq.com/api/quote/{sym}/info?assetclass=stocks"
+NASDAQ_HIST     = ("https://api.nasdaq.com/api/quote/{sym}/historical"
+                   "?assetclass=stocks&fromdate={frm}&todate={to}&limit=15")
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 FINNHUB_WS   = "wss://ws.finnhub.io?token="
 
@@ -447,6 +458,39 @@ def shares_out_millions(sym):
     return val
 
 
+_avg_vol_cache = {}     # sym -> (yyyymmdd, median prior-session volume)
+
+
+def avg_daily_volume(sym):
+    """Median daily volume over the prior ~2 weeks, cached once per symbol per day.
+
+    Median rather than mean so one prior spike cannot hide the next one.
+    """
+    day = now_et().strftime("%Y%m%d")
+    hit = _avg_vol_cache.get(sym)
+    if hit and hit[0] == day:
+        return hit[1]
+    n = now_et()
+    url = NASDAQ_HIST.format(sym=sym,
+                             frm=(n - timedelta(days=21)).strftime("%Y-%m-%d"),
+                             to=n.strftime("%Y-%m-%d"))
+    avg = None
+    try:
+        r = _http.get(url, headers=NASDAQ_HEADERS, timeout=12)
+        if r.status_code == 200:
+            tbl = (r.json().get("data") or {}).get("tradesTable") or {}
+            rows = tbl.get("rows") or []
+            # rows[0] is the current session -- skip it, we want the baseline.
+            vols = [v for v in (_num(x.get("volume")) for x in rows[1:11]) if v]
+            if len(vols) >= 3:
+                vols.sort()
+                avg = vols[len(vols) // 2]
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
+    _avg_vol_cache[sym] = (day, avg)
+    return avg
+
+
 def too_big(sym):
     """Fleet-wide gate: True if this company exceeds MAX_MARKET_CAP.
 
@@ -584,6 +628,7 @@ def discover_movers():
         return []
 
     out = []
+    quiet_heavy = []        # big turnover, no big price move (yet)
     for row in rows:
         sym = (row.get("symbol") or "").strip().upper()
         price = _num(row.get("lastsale"))
@@ -595,18 +640,40 @@ def discover_movers():
             continue
         if price < PRICE_MIN or price > PRICE_MAX:
             continue
-        if pct < MIN_PERCENT:
-            continue
-        if vol < MIN_VOLUME or (price * vol) < MIN_DOLLAR_VOL:
-            continue
         mcap = _num(row.get("marketCap"))
         if mcap is not None and mcap > MAX_MARKET_CAP:
+            continue
+        if pct < MIN_PERCENT:
+            # Not a mover on price -- but heavy turnover on a flat tape is the
+            # accumulation setup that precedes the run, so keep it as a candidate.
+            if (pct >= 0 and vol >= RVOL_MIN_SHARES
+                    and (price * vol) >= RVOL_MIN_DOLLAR):
+                quiet_heavy.append({"symbol": sym, "price": price,
+                                    "pct": pct, "volume": vol})
+            continue
+        if vol < MIN_VOLUME or (price * vol) < MIN_DOLLAR_VOL:
             continue
         out.append({"symbol": sym, "price": price, "pct": pct, "volume": vol})
 
     out.sort(key=lambda d: d["pct"], reverse=True)
-    log.info("Scanner: %d rows -> %d small-cap movers matched", len(rows), len(out))
-    return out
+
+    # Resolve relative volume for the heaviest quiet names only (each baseline is
+    # one extra request, cached per day, so this is capped per scan).
+    quiet_heavy.sort(key=lambda d: d["volume"], reverse=True)
+    unusual = []
+    for c in quiet_heavy[:RVOL_LOOKUPS_MAX]:
+        base = avg_daily_volume(c["symbol"])
+        if not base:
+            continue
+        rvol = c["volume"] / base
+        if rvol >= RVOL_MIN:
+            c["rvol"] = rvol
+            unusual.append(c)
+    unusual.sort(key=lambda d: d["rvol"], reverse=True)
+
+    log.info("Scanner: %d rows -> %d movers, %d unusual-volume", len(rows),
+             len(out), len(unusual))
+    return out, unusual
 
 
 def _ws_sync(desired):
@@ -632,7 +699,20 @@ def scan_market():
     """Regular hours only: find runners, alert new ones, refresh the watchlist."""
     if session() != "regular":
         return
-    movers = discover_movers()
+    movers, unusual = discover_movers()
+
+    day = now_et().strftime("%Y%m%d")
+    for u in unusual:
+        sym = u["symbol"]
+        if not once("unusual:" + sym + ":" + day):
+            continue
+        _catalyst.add(sym)          # worth watching in the next extended sweep
+        send_telegram(
+            "\U0001F50A <b>UNUSUAL VOLUME</b>\n"
+            + "<b>" + html.escape(sym) + "</b>  $" + format(u["price"], ",.2f")
+            + "  " + format(u["rvol"], ",.0f") + "x avg vol"
+        )
+
     if not movers:
         return
 
