@@ -130,6 +130,13 @@ TOP_N_ALERTS   = 15
 MAX_WATCH      = 45                # free Finnhub WS cap is 50
 LOWFLOAT_MAX_M = 50.0              # shares-out (millions) -> "LOW FLOAT" tag
 
+# --- First-day listings (IPO / direct listing / de-SPAC) ---
+# No prior close exists, so every %-change filter is blind to them. Measured
+# on the session's own low-to-high range instead.
+NEW_LISTING_MIN_RANGE = 20.0       # % from session low
+NEW_LISTING_MIN_VOL   = 250_000
+NEW_LISTING_MAX_POLL  = 40         # candidates polled per pass
+
 # --- Extended-hours (premarket / after-hours) filters ---
 PM_MIN_PERCENT   = 20.0            # bigger threshold: extended moves are wilder
 PM_MIN_VOLUME    = 50000           # extended-session share volume floor
@@ -151,6 +158,7 @@ INTERVAL_UNIVERSE = 600
 INTERVAL_HALTS    = 20
 INTERVAL_NEWS     = 120
 INTERVAL_MOVER_NEWS = 300
+INTERVAL_NEWLIST  = 120
 INTERVAL_VOLROLL  = VOL_BUCKET_SEC
 
 NASDAQ_HALT_RSS = "http://www.nasdaqtrader.com/rss.aspx?feed=tradehalts"
@@ -158,6 +166,7 @@ NASDAQ_SCREENER = ("https://api.nasdaq.com/api/screener/stocks"
                    "?tableonly=true&limit=6000&offset=0&download=true")
 NASDAQ_EXTENDED = ("https://api.nasdaq.com/api/quote/{sym}/extended-trading"
                    "?assetclass=stocks&markettype={mt}&time=1")
+NASDAQ_IPO      = "https://api.nasdaq.com/api/ipo/calendar?date={ym}"
 NASDAQ_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -235,6 +244,7 @@ HEARTBEAT_SEC    = 900
 # if the main loop stops ticking, kill the process so Railway's "restart on
 # failure" policy brings it straight back.
 WATCHDOG_TIMEOUT = 600
+SAVE_MIN_GAP     = 60      # min seconds between de-dup writes to the volume
 _last_tick = [time.time()]
 
 DRY_RUN = "--test" in sys.argv
@@ -459,6 +469,8 @@ def shares_out_millions(sym):
 
 
 _avg_vol_cache = {}     # sym -> (yyyymmdd, median prior-session volume)
+_ipo_cache = {}         # {'day': yyyymmdd, 'syms': set()}
+_unlisted_seen = set()  # symbols seen in the halt feed but absent from the universe
 
 
 def avg_daily_volume(sym):
@@ -1153,6 +1165,110 @@ def check_market_news():
                  found, len(_catalyst))
 
 
+def parse_extended_raw(payload):
+    """Extended-hours figures WITHOUT requiring a percent change.
+
+    A first-day listing has no prior close, so Nasdaq returns previousInfo=None
+    and a bare consolidated like "$8.45" with no "(+x%)". parse_extended() needs
+    that percent and returns None, which is why new listings were invisible.
+    """
+    try:
+        d = (payload or {}).get("data") or {}
+        rows = ((d.get("infoTable") or {}).get("rows") or [])
+        if not rows:
+            return None
+        row = rows[0]
+        pm = _PRICE_RE.search(str(row.get("consolidated") or ""))
+        if not pm:
+            return None
+        hm = _PRICE_RE.search(str(row.get("highPrice") or ""))
+        lm = _PRICE_RE.search(str(row.get("lowPrice") or ""))
+        return {
+            "price": float(pm.group(1)),
+            "high": float(hm.group(1)) if hm else None,
+            "low": float(lm.group(1)) if lm else None,
+            "volume": _num(row.get("volume")) or 0.0,
+            "has_prev": bool(str(d.get("previousInfo") or "").strip()),
+        }
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def ipo_calendar_symbols():
+    """Recently priced IPO tickers for the current month (cached per day)."""
+    day = now_et().strftime("%Y%m%d")
+    if _ipo_cache.get("day") == day:
+        return _ipo_cache.get("syms", set())
+    syms = set()
+    try:
+        r = _http.get(NASDAQ_IPO.format(ym=now_et().strftime("%Y-%m")),
+                      headers=NASDAQ_HEADERS, timeout=15)
+        if r.status_code == 200:
+            rows = ((r.json().get("data") or {}).get("priced") or {}).get("rows") or []
+            for x in rows:
+                s = (x.get("proposedTickerSymbol") or "").strip().upper()
+                if s and re.fullmatch(r"[A-Z]{1,6}", s):
+                    syms.add(s)
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
+    _ipo_cache.clear()
+    _ipo_cache.update({"day": day, "syms": syms})
+    return syms
+
+
+def check_new_listings():
+    """Alert on first-day listings (IPOs, direct listings, de-SPACs).
+
+    These have NO prior close, so every percent-change filter in the system is
+    blind to them -- yet they are often the wildest premarket names (PSQL ran
+    $16.60 to $33.99 on debut). Candidates come from the IPO calendar and from
+    any symbol in the halt feed we have never seen in the universe (new issues
+    almost always print an IPO1/IPOQ halt at open). The move is measured across
+    the session low-to-last range, since there is nothing else to anchor to.
+    """
+    sess = session()
+    if sess not in ("pre", "regular", "post"):
+        return
+    with _universe_lock:
+        known = set(_universe) | set(_mcap_all)
+    cands = (ipo_calendar_symbols() | _unlisted_seen) - known
+    if not cands:
+        return
+    markettype = "post" if sess == "post" else "pre"
+    day = now_et().strftime("%Y%m%d")
+    checked = 0
+    for sym in sorted(cands)[:NEW_LISTING_MAX_POLL]:
+        url = NASDAQ_EXTENDED.format(sym=sym, mt=markettype)
+        try:
+            r = _http.get(url, headers=NASDAQ_HEADERS, timeout=12)
+            q = parse_extended_raw(r.json()) if r.status_code == 200 else None
+        except (requests.RequestException, ValueError):
+            q = None
+        checked += 1
+        time.sleep(0.2)
+        if not q or q["has_prev"]:
+            continue            # has a prior close -> not a first-day listing
+        low, price, vol = q.get("low"), q["price"], q["volume"]
+        if not low or low <= 0 or vol < NEW_LISTING_MIN_VOL:
+            continue
+        rng = (price - low) / low * 100.0
+        peak = ((q["high"] - low) / low * 100.0) if q.get("high") else rng
+        if peak < NEW_LISTING_MIN_RANGE:
+            continue
+        tier = int(peak // 50)
+        if not once("newlist:" + sym + ":" + day + ":" + str(tier)):
+            continue
+        _catalyst.add(sym)
+        hi = ("  \u2022  High $" + format(q["high"], ",.2f")) if q.get("high") else ""
+        send_telegram(
+            "\U0001F195 <b>NEW LISTING</b>\n"
+            + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
+            + "  (" + format(rng, "+.0f") + "% off low)" + hi
+        )
+    if checked:
+        log.info("New-listing scan: polled %d candidates", checked)
+
+
 def check_mover_news():
     """Pull catalysts for stocks the scanner has ALREADY flagged as moving.
 
@@ -1250,6 +1366,10 @@ def check_halts():
             continue
         if _silent:
             continue        # priming a redeploy: record the id, don't fetch or send
+        with _universe_lock:
+            unknown = sym not in _universe and sym not in _mcap_all
+        if unknown:
+            _unlisted_seen.add(sym)   # likely a brand-new listing
         if too_big(sym):              # fleet-wide market-cap gate
             continue
         _catalyst.add(sym)            # halted names are prime premarket candidates
@@ -1399,6 +1519,7 @@ def main():
         (scan_market,        INTERVAL_SCAN),
         (check_market_news,  INTERVAL_NEWS),
         (check_mover_news,   INTERVAL_MOVER_NEWS),
+        (check_new_listings, INTERVAL_NEWLIST),
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
     ]
@@ -1407,6 +1528,7 @@ def main():
     next_run = {fn.__name__: time.time() + (3 if fn in soon else interval)
                 for fn, interval in schedule}
     last_saved_n = len(_seen)
+    last_save_ts = 0.0
     cur_day = now_et().strftime("%Y%m%d")
     last_beat = time.time()
 
@@ -1436,9 +1558,15 @@ def main():
                 except Exception as e:  # noqa: BLE001 - never let one feed kill the loop
                     log.error("%s failed: %s", fn.__name__, e)
                 next_run[fn.__name__] = time.time() + interval
-        if len(_seen) != last_saved_n:
+        # Persist at most once a minute. This used to fire on every change to
+        # _seen -- i.e. constantly during a scan -- re-serialising a set of
+        # thousands of keys and writing it to the network-backed volume each
+        # time, on this thread. That was a large, needless CPU + I/O burn and a
+        # place the loop could block.
+        if len(_seen) != last_saved_n and time.time() - last_save_ts >= SAVE_MIN_GAP:
             _save_seen()
             last_saved_n = len(_seen)
+            last_save_ts = time.time()
         time.sleep(1)
 
 
