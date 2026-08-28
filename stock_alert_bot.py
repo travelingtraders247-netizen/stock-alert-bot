@@ -127,6 +127,12 @@ RVOL_LOOKUPS_MAX = 15              # new baseline fetches per scan (rate control
 MIN_VOLUME     = 100000
 MIN_DOLLAR_VOL = 250000
 TOP_N_ALERTS   = 15
+
+# Runner confirmation. A >=10% move alone is not enough: it must carry real
+# volume and have actually travelled intraday rather than gapping and stalling.
+RUNNER_RVOL_MIN      = 2.0   # day volume vs median prior daily volume
+RUNNER_MIN_FROM_OPEN = 7.0   # % gained since today's open
+RUNNER_CTX_LOOKUPS   = 20    # baseline fetches per scan (cached per day)
 MAX_WATCH      = 45                # free Finnhub WS cap is 50
 LOWFLOAT_MAX_M = 50.0              # shares-out (millions) -> "LOW FLOAT" tag
 
@@ -471,39 +477,47 @@ def shares_out_millions(sym):
     return val
 
 
-_avg_vol_cache = {}     # sym -> (yyyymmdd, median prior-session volume)
-_ipo_cache = {}         # {'day': yyyymmdd, 'syms': set()}
-_unlisted_seen = set()  # symbols seen in the halt feed but absent from the universe
+_day_ctx_cache = {}     # sym -> (yyyymmdd, today's open, median prior volume)
 
 
-def avg_daily_volume(sym):
-    """Median daily volume over the prior ~2 weeks, cached once per symbol per day.
+def day_context(sym):
+    """(today's open, median prior daily volume) from one cached historical call.
 
-    Median rather than mean so one prior spike cannot hide the next one.
+    Both come from the same request and neither changes during a session, so
+    this is fetched once per symbol per day.
     """
     day = now_et().strftime("%Y%m%d")
-    hit = _avg_vol_cache.get(sym)
+    hit = _day_ctx_cache.get(sym)
     if hit and hit[0] == day:
-        return hit[1]
+        return hit[1], hit[2]
     n = now_et()
     url = NASDAQ_HIST.format(sym=sym,
                              frm=(n - timedelta(days=21)).strftime("%Y-%m-%d"),
                              to=n.strftime("%Y-%m-%d"))
-    avg = None
+    op = avg = None
     try:
         r = _http.get(url, headers=NASDAQ_HEADERS, timeout=12)
         if r.status_code == 200:
             tbl = (r.json().get("data") or {}).get("tradesTable") or {}
             rows = tbl.get("rows") or []
-            # rows[0] is the current session -- skip it, we want the baseline.
+            if rows:
+                op = _num(rows[0].get("open"))
+            # rows[0] is today; the baseline is the sessions before it.
             vols = [v for v in (_num(x.get("volume")) for x in rows[1:11]) if v]
             if len(vols) >= 3:
                 vols.sort()
                 avg = vols[len(vols) // 2]
     except (requests.RequestException, ValueError, AttributeError):
         pass
-    _avg_vol_cache[sym] = (day, avg)
-    return avg
+    _day_ctx_cache[sym] = (day, op, avg)
+    return op, avg
+
+
+def avg_daily_volume(sym):
+    """Median prior daily volume. Shares day_context's cached fetch so the
+    RVOL paths and the runner confirmation never request the same symbol twice.
+    """
+    return day_context(sym)[1]
 
 
 def too_big(sym):
@@ -739,17 +753,36 @@ def scan_market():
 
     day = now_et().strftime("%Y%m%d")
     alerted = 0
+    ctx_lookups = 0
     for m in movers:
         if alerted >= TOP_N_ALERTS:
             break
         sym = m["symbol"]
         if not once("runner:" + sym + ":" + day):
             continue
+        # Confirm the move: it must be carrying unusual volume AND have travelled
+        # intraday, not just gapped and gone flat. NAKA alerted on 0.75x average
+        # volume and WRAP on 0.99x -- no surge at all -- and both stalled.
+        if ctx_lookups < RUNNER_CTX_LOOKUPS:
+            open_px, base = day_context(sym)
+            ctx_lookups += 1
+        else:
+            open_px = base = None
+        rv = (m["volume"] / base) if base else None
+        if rv is not None and rv < RUNNER_RVOL_MIN:
+            continue
+        if open_px and open_px > 0:
+            from_open = (m["price"] - open_px) / open_px * 100.0
+            if from_open < RUNNER_MIN_FROM_OPEN:
+                continue
+        if rv is None:
+            log.warning("No volume baseline for %s; alerting unconfirmed", sym)
+        rv_txt = ("  (" + format(rv, ",.1f") + "x avg)") if rv else ""
         send_telegram(
             "\U0001F680 <b>SMALL-CAP RUNNER</b>\n"
             + "<b>" + html.escape(sym) + "</b>  $" + format(m["price"], ",.2f")
             + "  (" + format(m["pct"], "+.1f") + "%)\n"
-            + "Vol: " + format(int(m["volume"]), ",") + lowfloat_tag(sym)
+            + "Vol: " + format(int(m["volume"]), ",") + rv_txt + lowfloat_tag(sym)
         )
         alerted += 1
 
