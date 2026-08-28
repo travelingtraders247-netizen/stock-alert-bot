@@ -146,12 +146,16 @@ NEW_LISTING_MAX_POLL  = 40         # candidates polled per pass
 # --- Extended-hours (premarket / after-hours) filters ---
 PM_MIN_PERCENT   = 20.0            # bigger threshold: extended moves are wilder
 PM_MIN_VOLUME    = 50000           # extended-session share volume floor
-EXT_WORKERS      = 5               # concurrent extended fetches (trial-plan safe)
+EXT_WORKERS      = 10               # concurrent extended fetches (trial-plan safe)
                                    # (measured: ~43ms/symbol, 0 failures at 12)
 MAX_EXT_ALERTS   = 20              # alerts per sweep (biggest movers first)
 EXT_RVOL_MIN        = 2.0          # extended volume vs a normal FULL day
 EXT_RVOL_MIN_SHARES = 400_000      # absolute floor before we bother looking up
-EXT_RVOL_LOOKUPS    = 12           # baseline fetches per sweep
+EXT_RVOL_LOOKUPS    = 12
+EXT_TIMEOUT         = 8            # per-symbol extended fetch timeout
+EXT_PRIORITY_PCT    = 10.0         # |today move| that earns a front-of-queue probe
+EXT_PRIORITY_VOL    = 300_000      # ...paired with real turnover
+EXT_TAIL_CHUNK      = 700          # long-tail symbols per sweep (rotates)           # baseline fetches per sweep
 
 # Volume-surge thresholds (WebSocket trades)
 VOL_BUCKET_SEC  = 60
@@ -513,6 +517,10 @@ def day_context(sym):
     return op, avg
 
 
+_ipo_cache = {}         # {"day": yyyymmdd, "syms": set()} -- cached daily
+_unlisted_seen = set()  # in the halt feed but absent from the universe
+
+
 def avg_daily_volume(sym):
     """Median prior daily volume. Shares day_context's cached fetch so the
     RVOL paths and the runner confirmation never request the same symbol twice.
@@ -603,6 +611,7 @@ def refresh_universe():
             "mcap": mcap,
             "name": (row.get("name") or "").strip(),
             "vol": _num(row.get("volume")) or 0.0,
+            "pct": _num(str(row.get("pctchange") or "").replace("%", "")) or 0.0,
         }
     # Company-name -> ticker index, so a PR headline that says "Expion" or
     # "Reitar Logtech" (and never prints the symbol) can still be matched.
@@ -794,7 +803,7 @@ _PCT_RE = re.compile(r"\(([+-]?[\d.]+)\s*%\)")
 _PRICE_RE = re.compile(r"\$([\d.]+)")
 
 
-def parse_extended(payload):
+def parse_extended(payload, base=None):
     """
     Parse Nasdaq's extended-trading JSON.
     Returns {"price","pct","volume","high"} or None.
@@ -819,11 +828,20 @@ def parse_extended(payload):
         # trigger on whichever is larger, or fast movers slip straight past us.
         pv = _PRICE_RE.search(str(d.get("previousInfo") or ""))
         prev = float(pv.group(1)) if pv else None
+        # After the close, previousInfo still reports YESTERDAY close. AEHL
+        # closed -30% at $3.54 then ran to $6.23 after hours -- a +76% move
+        # the feed labelled "+2.28%" because it still measured off $5.09.
+        # When the caller knows today close, that is the only honest base.
+        price = float(pm.group(1))
+        pct = float(pc.group(1))
+        if base and base > 0:
+            prev = base
+            pct = (price - base) / base * 100.0
         pct_high = (((high - prev) / prev) * 100.0
                     if (high and prev and prev > 0) else None)
         return {
-            "price": float(pm.group(1)),
-            "pct": float(pc.group(1)),
+            "price": price,
+            "pct": pct,
             "volume": _num(row.get("volume")) or 0.0,
             "high": high,
             "prev": prev,
@@ -842,16 +860,23 @@ def fetch_extended(sym, markettype):
     together made a normal quiet market look like a 72% failure rate.
     """
     url = NASDAQ_EXTENDED.format(sym=sym, mt=markettype)
+    base = None
+    if markettype == "post":
+        with _universe_lock:
+            base = (_universe.get(sym) or {}).get("close")
     try:
-        r = _http.get(url, headers=NASDAQ_HEADERS, timeout=12)
+        r = _http.get(url, headers=NASDAQ_HEADERS, timeout=EXT_TIMEOUT)
     except requests.RequestException:
         return "ERR"
     if r.status_code != 200:
         return "ERR"
     try:
-        return parse_extended(r.json())
+        return parse_extended(r.json(), base)
     except ValueError:
         return "ERR"
+
+
+_ext_cursor = [0]        # rotates the long tail across sweeps
 
 
 def build_candidates():
@@ -870,19 +895,35 @@ def build_candidates():
         uni = dict(_universe)
     if not uni:
         return []
+    # Today movers first, whichever way they moved. AEHL closed -30% on 6x
+    # volume then doubled after hours; ranked by PRIOR-day turnover it sat
+    # ~2,500 names deep in a sweep that never reached it.
+    movers = sorted(
+        (s for s, i in uni.items()
+         if abs(i.get("pct") or 0.0) >= EXT_PRIORITY_PCT
+         and (i.get("vol") or 0.0) >= EXT_PRIORITY_VOL),
+        key=lambda s: abs(uni[s].get("pct") or 0.0), reverse=True)
     ordered, seen = [], set()
-    for group in (sorted(_catalyst), sorted(_watchlist)):
+    for group in (sorted(_catalyst), sorted(_watchlist), movers):
         for s in group:
             if s in uni and s not in seen:
                 ordered.append(s)
                 seen.add(s)
-    rest = sorted(uni.items(),
-                  key=lambda kv: (kv[1].get("vol") or 0) * (kv[1].get("close") or 0),
-                  reverse=True)
-    for s, _info in rest:
-        if s not in seen:
-            ordered.append(s)
-            seen.add(s)
+    # The long tail is real but slow: 2,891 symbols at 5 workers took over an
+    # hour per sweep, so anything past the first few hundred was never polled
+    # while it mattered. Rotate through it a chunk at a time instead -- full
+    # coverage every few sweeps, and every sweep actually finishes.
+    tail = [s for s, _i in sorted(
+        uni.items(),
+        key=lambda kv: (kv[1].get("vol") or 0) * (kv[1].get("close") or 0),
+        reverse=True) if s not in seen]
+    if tail:
+        start = _ext_cursor[0] % len(tail)
+        chunk = tail[start:start + EXT_TAIL_CHUNK]
+        if len(chunk) < EXT_TAIL_CHUNK:
+            chunk += tail[:EXT_TAIL_CHUNK - len(chunk)]
+        _ext_cursor[0] = (start + EXT_TAIL_CHUNK) % len(tail)
+        ordered.extend(chunk)
     return ordered
 
 
