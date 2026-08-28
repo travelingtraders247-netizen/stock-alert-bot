@@ -143,6 +143,9 @@ PM_MIN_VOLUME    = 50000           # extended-session share volume floor
 EXT_WORKERS      = 5               # concurrent extended fetches (trial-plan safe)
                                    # (measured: ~43ms/symbol, 0 failures at 12)
 MAX_EXT_ALERTS   = 20              # alerts per sweep (biggest movers first)
+EXT_RVOL_MIN        = 2.0          # extended volume vs a normal FULL day
+EXT_RVOL_MIN_SHARES = 400_000      # absolute floor before we bother looking up
+EXT_RVOL_LOOKUPS    = 12           # baseline fetches per sweep
 
 # Volume-surge thresholds (WebSocket trades)
 VOL_BUCKET_SEC  = 60
@@ -776,11 +779,22 @@ def parse_extended(payload):
         if not pm or not pc:
             return None
         hm = _PRICE_RE.search(str(row.get("highPrice") or ""))
+        high = float(hm.group(1)) if hm else None
+        # The consolidated last-trade badly lags a fast tape: TNON printed
+        # "+1.00%" here while the live quote was +35.66% and the session high was
+        # +63%. Derive the move off the session high vs the prior close too, and
+        # trigger on whichever is larger, or fast movers slip straight past us.
+        pv = _PRICE_RE.search(str(d.get("previousInfo") or ""))
+        prev = float(pv.group(1)) if pv else None
+        pct_high = (((high - prev) / prev) * 100.0
+                    if (high and prev and prev > 0) else None)
         return {
             "price": float(pm.group(1)),
             "pct": float(pc.group(1)),
             "volume": _num(row.get("volume")) or 0.0,
-            "high": float(hm.group(1)) if hm else None,
+            "high": high,
+            "prev": prev,
+            "pct_high": pct_high,
         }
     except (AttributeError, TypeError, ValueError):
         return None
@@ -852,6 +866,7 @@ def scan_extended():
     label = "PREMARKET" if sess == "pre" else "AFTER-HOURS"
     t0 = time.time()
     hits = []
+    heavy = []
     fails = 0
 
     def probe(sym):
@@ -869,12 +884,37 @@ def scan_extended():
             price, pct, vol = q["price"], q["pct"], q["volume"]
             if price < PRICE_MIN or price > PRICE_MAX:
                 continue
-            if pct < PM_MIN_PERCENT or vol < PM_MIN_VOLUME:
+            if vol < PM_MIN_VOLUME:
                 continue
-            hits.append((pct, sym, price, vol, q.get("high")))
+            # Trigger on the bigger of "where it is now" and "where it got to".
+            peak = max(pct, q.get("pct_high") or pct)
+            if peak >= PM_MIN_PERCENT:
+                hits.append((peak, sym, price, vol, q.get("high")))
+            elif vol >= EXT_RVOL_MIN_SHARES:
+                heavy.append((vol, sym, price, q.get("high")))
+
+    # Heavy extended volume without a big price move yet. TNON traded 6.3x a
+    # normal FULL day's volume before the open while its last print still read
+    # +1% -- that is the signal, and it only exists in extended hours.
+    heavy.sort(reverse=True)
+    day = now_et().strftime("%Y%m%d")
+    for vol, sym, price, high in heavy[:EXT_RVOL_LOOKUPS]:
+        base = avg_daily_volume(sym)
+        if not base:
+            continue
+        rv = vol / base
+        if rv < EXT_RVOL_MIN:
+            continue
+        if not once("extvol:" + markettype + ":" + sym + ":" + day):
+            continue
+        _catalyst.add(sym)
+        send_telegram(
+            "\U0001F50A <b>" + label + " VOLUME</b>\n"
+            + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
+            + "  " + format(rv, ",.1f") + "x daily vol"
+        )
 
     hits.sort(key=lambda h: h[0], reverse=True)   # biggest movers alert first
-    day = now_et().strftime("%Y%m%d")
     sent = 0
     for pct, sym, price, vol, high in hits:
         if sent >= MAX_EXT_ALERTS:
