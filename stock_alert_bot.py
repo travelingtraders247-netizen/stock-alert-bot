@@ -256,6 +256,7 @@ EDGAR_MIN_RVOL     = 2.0           # ...or this much of a normal day's volume
 EDGAR_PENDING_SEC  = 21600         # hold an unconfirmed filing 6h, then drop it
 EDGAR_MAX_PENDING  = 300
 EDGAR_RVOL_LOOKUPS = 10            # baseline fetches per confirmation pass
+EDGAR_TIMEOUT      = 30            # browse-edgar is slow; 20s timed out
 INTERVAL_EDGAR     = 300
 INTERVAL_EDGAR_OK  = 120
 
@@ -1366,7 +1367,7 @@ def poll_edgar():
     for form in SEC_FORMS:
         try:
             r = _http.get(SEC_RECENT_URL.format(typ=form.replace(" ", "+")),
-                          headers=SEC_HEADERS, timeout=20)
+                          headers=SEC_HEADERS, timeout=EDGAR_TIMEOUT)
             if r.status_code != 200:
                 log.warning("EDGAR %s HTTP %s", form, r.status_code)
                 continue
@@ -1396,6 +1397,21 @@ def poll_edgar():
     if queued:
         log.info("EDGAR: %d filings queued (%d awaiting confirmation)",
                  queued, len(_edgar_pending))
+
+
+def _edgar_loop():
+    """Poll EDGAR on its own thread.
+
+    Four form types against a slow SEC endpoint can take a minute or more.
+    The main scheduler runs the halt feed every 20s and must not queue behind
+    it."""
+    while True:
+        started = time.time()
+        try:
+            poll_edgar()
+        except Exception as e:  # noqa: BLE001
+            log.error("poll_edgar failed: %s", e)
+        time.sleep(max(30, INTERVAL_EDGAR - (time.time() - started)))
 
 
 def confirm_edgar():
@@ -1794,6 +1810,8 @@ def main():
     t.start()
     # Full-universe extended sweep runs on its own thread (it takes ~1-2 min).
     threading.Thread(target=_extended_loop, daemon=True).start()
+    # EDGAR polling is slow and bursty; give it its own thread too.
+    threading.Thread(target=_edgar_loop, daemon=True).start()
 
     schedule = [
         (refresh_universe,   INTERVAL_UNIVERSE),
@@ -1803,7 +1821,6 @@ def main():
         (check_new_listings, INTERVAL_NEWLIST),
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
-        (poll_edgar,         INTERVAL_EDGAR),
         (confirm_edgar,      INTERVAL_EDGAR_OK),
     ]
     # Kick off the scanners almost immediately so alerts start flowing.
