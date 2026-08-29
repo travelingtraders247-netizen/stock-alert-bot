@@ -151,11 +151,11 @@ EXT_WORKERS      = 10               # concurrent extended fetches (trial-plan sa
 MAX_EXT_ALERTS   = 20              # alerts per sweep (biggest movers first)
 EXT_RVOL_MIN        = 2.0          # extended volume vs a normal FULL day
 EXT_RVOL_MIN_SHARES = 400_000      # absolute floor before we bother looking up
-EXT_RVOL_LOOKUPS    = 12
+EXT_RVOL_LOOKUPS    = 12           # baseline fetches per sweep
 EXT_TIMEOUT         = 8            # per-symbol extended fetch timeout
 EXT_PRIORITY_PCT    = 10.0         # |today move| that earns a front-of-queue probe
 EXT_PRIORITY_VOL    = 300_000      # ...paired with real turnover
-EXT_TAIL_CHUNK      = 700          # long-tail symbols per sweep (rotates)           # baseline fetches per sweep
+EXT_TAIL_CHUNK      = 700          # long-tail symbols per sweep (rotates)
 
 # Volume-surge thresholds (WebSocket trades)
 VOL_BUCKET_SEC  = 60
@@ -245,6 +245,19 @@ HALT_REASONS = {
 # often any one ticker can produce a catalyst alert in a rolling window.
 NEWS_MAX_PER_24H = 2
 NEWS_WINDOW_SEC  = 86400
+
+# --- SEC EDGAR filings -------------------------------------------------------
+# A filing on its own is NOT an alert. Thousands are published every day and most
+# move nothing. A queued filing only becomes an alert once the tape confirms it:
+# the ticker has to be up meaningfully, or turning over unusual volume, or
+# already flagged by another alert today. Unconfirmed filings expire quietly.
+EDGAR_MIN_PCT      = 7.0           # move that counts as confirmation on its own
+EDGAR_MIN_RVOL     = 2.0           # ...or this much of a normal day's volume
+EDGAR_PENDING_SEC  = 21600         # hold an unconfirmed filing 6h, then drop it
+EDGAR_MAX_PENDING  = 300
+EDGAR_RVOL_LOOKUPS = 10            # baseline fetches per confirmation pass
+INTERVAL_EDGAR     = 300
+INTERVAL_EDGAR_OK  = 120
 
 # Never block the scheduler for more than this on a Telegram rate-limit, and emit
 # a heartbeat so a silent stall is obvious in the logs.
@@ -517,8 +530,8 @@ def day_context(sym):
     return op, avg
 
 
-_ipo_cache = {}         # {"day": yyyymmdd, "syms": set()} -- cached daily
-_unlisted_seen = set()  # in the halt feed but absent from the universe
+_ipo_cache = {}         # {'day': yyyymmdd, 'syms': set()}
+_unlisted_seen = set()  # symbols seen in the halt feed but absent from the universe
 
 
 def avg_daily_volume(sym):
@@ -1279,6 +1292,160 @@ def check_market_news():
                  found, len(_catalyst))
 
 
+# ----------------------------------------------------------------------
+# ALERT 7: SEC EDGAR FILINGS  (queued, alerted only when the tape confirms)
+# ----------------------------------------------------------------------
+# AEHL's $19M private placement never crossed a PR wire -- it surfaced in an SEC
+# filing that Reuters and TipRanks picked up, so every wire-based feed we run was
+# blind to it. EDGAR closes that gap. But EDGAR is a firehose: filings alone
+# would bury the channel, so nothing here alerts on a filing by itself.
+SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_RECENT_URL = ("https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent"
+                  "&type={typ}&dateb=&owner=include&count=100&output=atom")
+# The forms that actually move small caps: material events, foreign-issuer
+# reports (AEHL files 6-K), priced offerings/shelf takedowns, and new 5% stakes.
+SEC_FORMS = ("8-K", "6-K", "424B5", "SC 13D")
+_FORM_LABEL = {
+    "8-K": "8-K material event",
+    "6-K": "6-K foreign issuer report",
+    "424B5": "424B5 offering priced (shelf takedown)",
+    "SC 13D": "SC 13D new 5%+ stake",
+}
+# The SEC asks automated clients to identify themselves. Set SEC_CONTACT to your
+# own email in Railway; the default is deliberately generic.
+SEC_CONTACT = os.getenv("SEC_CONTACT") or "stock-alert-bot (automated market monitor)"
+SEC_HEADERS = {"User-Agent": SEC_CONTACT, "Accept-Encoding": "gzip, deflate"}
+
+_CIK_RE = re.compile(r"\((\d{7,10})\)")
+_cik_map = {}            # {"day": yyyymmdd, "map": {cik_int: ticker}}
+_edgar_pending = {}      # sym -> (first_seen_ts, form, company_name)
+_edgar_lock = threading.Lock()
+
+
+def sec_ticker_map():
+    """CIK -> ticker for every SEC registrant. One file, refreshed once a day."""
+    day = now_et().strftime("%Y%m%d")
+    if _cik_map.get("day") == day and _cik_map.get("map"):
+        return _cik_map["map"]
+    try:
+        r = _http.get(SEC_TICKERS_URL, headers=SEC_HEADERS, timeout=20)
+        if r.status_code != 200:
+            log.warning("SEC ticker map HTTP %s", r.status_code)
+            return _cik_map.get("map") or {}
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        log.warning("SEC ticker map failed: %s", e)
+        return _cik_map.get("map") or {}
+    rows = data.values() if isinstance(data, dict) else data
+    m = {}
+    for row in rows:
+        try:
+            m[int(row["cik_str"])] = str(row["ticker"]).upper()
+        except (KeyError, TypeError, ValueError):
+            continue
+    if m:
+        _cik_map.clear()
+        _cik_map.update({"day": day, "map": m})
+        log.info("SEC ticker map: %d CIKs", len(m))
+    return m
+
+
+def _sec_headline(form, name):
+    label = _FORM_LABEL.get(form, form + " filing")
+    return "SEC " + label + " - " + name
+
+
+def poll_edgar():
+    """Queue new filings for tickers in our small-cap universe. Alerts nothing."""
+    if feedparser is None:
+        return
+    cmap = sec_ticker_map()
+    if not cmap:
+        return
+    queued = 0
+    for form in SEC_FORMS:
+        try:
+            r = _http.get(SEC_RECENT_URL.format(typ=form.replace(" ", "+")),
+                          headers=SEC_HEADERS, timeout=20)
+            if r.status_code != 200:
+                log.warning("EDGAR %s HTTP %s", form, r.status_code)
+                continue
+            feed = feedparser.parse(r.content)
+        except requests.RequestException as e:
+            log.warning("EDGAR %s fetch failed: %s", form, e)
+            continue
+        for entry in getattr(feed, "entries", [])[:60]:
+            title = entry.get("title", "")
+            cm = _CIK_RE.search(title)
+            if not cm:
+                continue
+            sym = cmap.get(int(cm.group(1)))
+            if not sym:
+                continue
+            with _universe_lock:
+                if sym not in _universe:
+                    continue        # outside the small-cap price/cap band
+            if not once("edgar:" + sym + ":" + (entry.get("id") or title)[:120]):
+                continue
+            name = title.split(" - ", 1)[1] if " - " in title else title
+            name = _CIK_RE.sub("", name).replace("(Filer)", "").strip(" -")
+            with _edgar_lock:
+                if len(_edgar_pending) < EDGAR_MAX_PENDING:
+                    _edgar_pending[sym] = (time.time(), form, name)
+            queued += 1
+    if queued:
+        log.info("EDGAR: %d filings queued (%d awaiting confirmation)",
+                 queued, len(_edgar_pending))
+
+
+def confirm_edgar():
+    """Alert a queued filing only once the stock is actually doing something.
+
+    Confirmation is any ONE of: a real move up, unusual turnover, or the ticker
+    already being flagged by another alert today. No move, no alert -- the
+    filing simply expires. Downside moves never confirm.
+    """
+    with _edgar_lock:
+        pending = dict(_edgar_pending)
+    if not pending:
+        return
+    now_ts = time.time()
+    done = [s for s, (ts, _f, _n) in pending.items()
+            if now_ts - ts > EDGAR_PENDING_SEC]
+    lookups = 0
+    sent = 0
+    for sym, (ts, form, name) in sorted(pending.items()):
+        if sym in done:
+            continue
+        with _universe_lock:
+            info = dict(_universe.get(sym) or {})
+        pct = info.get("pct") or 0.0
+        vol = info.get("vol") or 0.0
+        if pct < 0:
+            continue                    # never alert a filing into a decline
+        ok = pct >= EDGAR_MIN_PCT
+        if not ok and (sym in _catalyst or sym in _watchlist):
+            ok = True                   # already moving on another signal today
+        if not ok and vol >= RVOL_MIN_SHARES and lookups < EDGAR_RVOL_LOOKUPS:
+            base = avg_daily_volume(sym)
+            lookups += 1
+            ok = bool(base) and (vol / base) >= EDGAR_MIN_RVOL
+        if not ok:
+            continue
+        if _news_alert(sym, _sec_headline(form, name), "SEC EDGAR", "",
+                       tag="SEC FILING"):
+            sent += 1
+        _catalyst.add(sym)
+        done.append(sym)
+    if done:
+        with _edgar_lock:
+            for s in done:
+                _edgar_pending.pop(s, None)
+    if sent:
+        log.info("EDGAR: %d filings confirmed by the tape (%d still pending)",
+                 sent, len(_edgar_pending))
+
+
 def parse_extended_raw(payload):
     """Extended-hours figures WITHOUT requiring a percent change.
 
@@ -1636,6 +1803,8 @@ def main():
         (check_new_listings, INTERVAL_NEWLIST),
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
+        (poll_edgar,         INTERVAL_EDGAR),
+        (confirm_edgar,      INTERVAL_EDGAR_OK),
     ]
     # Kick off the scanners almost immediately so alerts start flowing.
     soon = (scan_market, check_market_news)
