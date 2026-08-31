@@ -292,6 +292,18 @@ _log_q = queue.Queue(maxsize=5000)
 class _DropWhenFull(logging.handlers.QueueHandler):
     """Never block a worker thread just to emit a log line."""
 
+    def prepare(self, record):
+        # Same process, so no pickling is needed. The default prepare()
+        # pre-formats the record and the listener then formats it again,
+        # which double-prefixes every line.
+        return record
+
+    def prepare(self, record):
+        # Same process, so no pickling is needed. The default prepare()
+        # pre-formats the record and the listener then formats it again,
+        # which double-prefixes every line.
+        return record
+
     def enqueue(self, record):
         try:
             self.queue.put_nowait(record)
