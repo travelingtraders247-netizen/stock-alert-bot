@@ -262,6 +262,20 @@ EDGAR_TIMEOUT      = 30            # browse-edgar is slow; 20s timed out
 INTERVAL_EDGAR     = 300
 INTERVAL_EDGAR_OK  = 120
 
+# --- Top-10 gainers board ----------------------------------------------------
+# A leaderboard of the biggest percentage gainers, run separately for each
+# session (premarket / regular / after-hours) so each board reflects that
+# session's own move. The full board posts once when a session opens; after
+# that only NEW entrants are posted, so a name that stays on the board is never
+# repeated within the same session.
+BOARD_N            = 10
+BOARD_PRICE_MIN    = 0.50
+BOARD_PRICE_MAX    = 25.00
+BOARD_MIN_DOLLAR   = 250_000       # session turnover needed to be tradeable
+BOARD_POOL_MAX     = 60            # rows kept from each screener pass
+BOARD_MIN_OPEN     = 3             # do not open a board on one lonely name
+INTERVAL_BOARD     = 900           # re-rank every 15 minutes
+
 # Never block the scheduler for more than this on a Telegram rate-limit, and emit
 # a heartbeat so a silent stall is obvious in the logs.
 MAX_TG_SLEEP     = 60
@@ -286,6 +300,8 @@ DRY_RUN = "--test" in sys.argv
 # That is the exact signature of the 29-hour silent freeze on 2026-08-30.
 # Records now go onto a bounded queue that DROPS when full, so a stalled log
 # consumer costs us log lines instead of costing us the trading loops.
+NEWLINE = "\n"
+
 _log_q = queue.Queue(maxsize=5000)
 
 
@@ -720,6 +736,7 @@ def discover_movers():
         return []
 
     out = []
+    pool = []               # top-10 board candidates (wider price band)
     quiet_heavy = []        # big turnover, no big price move (yet)
     for row in rows:
         sym = (row.get("symbol") or "").strip().upper()
@@ -730,9 +747,16 @@ def discover_movers():
             continue
         if "^" in sym or "/" in sym or "." in sym:
             continue
+        mcap = _num(row.get("marketCap"))
+        # Board pool: a wider price band than the alert universe, taken from the
+        # screener pass we are already making, so it costs no extra requests.
+        if (BOARD_PRICE_MIN <= price <= BOARD_PRICE_MAX
+                and (mcap is None or mcap <= MAX_MARKET_CAP)
+                and (price * vol) >= BOARD_MIN_DOLLAR):
+            pool.append({"symbol": sym, "price": price, "pct": pct,
+                         "dollar": price * vol})
         if price < PRICE_MIN or price > PRICE_MAX:
             continue
-        mcap = _num(row.get("marketCap"))
         if mcap is not None and mcap > MAX_MARKET_CAP:
             continue
         if pct < MIN_PERCENT:
@@ -748,6 +772,11 @@ def discover_movers():
         out.append({"symbol": sym, "price": price, "pct": pct, "volume": vol})
 
     out.sort(key=lambda d: d["pct"], reverse=True)
+
+    pool.sort(key=lambda d: d["pct"], reverse=True)
+    with _board_lock:
+        _board_pool[:] = pool[:BOARD_POOL_MAX]
+        _board_pool_ts[0] = time.time()
 
     # Resolve relative volume for the heaviest quiet names only (each baseline is
     # one extra request, cached per day, so this is capped per scan).
@@ -930,6 +959,15 @@ def fetch_extended(sym, markettype):
         return "ERR"
 
 
+# Top-10 board state.
+_board_pool = []         # regular session: [{symbol, price, pct, dollar}, ...]
+_board_pool_ts = [0.0]
+_ext_board = {}          # extended sessions: sym -> (ts, price, pct, dollar)
+_board_seen = {}         # "yyyymmdd:session" -> set of symbols already posted
+_board_last = {"key": None, "ts": 0.0}
+_board_lock = threading.Lock()
+
+
 _ext_cursor = [0]        # rotates the long tail across sweeps
 
 
@@ -1010,6 +1048,11 @@ def scan_extended():
                 fails += 1          # no extended-hours trades: normal and expected
                 continue
             price, pct, vol = q["price"], q["pct"], q["volume"]
+            # Feed the top-10 board before any alert filter narrows things down:
+            # the board has its own wider price band and its own thresholds.
+            peak_pct = max(pct, q.get("pct_high") or pct)
+            with _board_lock:
+                _ext_board[sym] = (time.time(), price, peak_pct, price * vol)
             if price < PRICE_MIN or price > PRICE_MAX:
                 continue
             if vol < PM_MIN_VOLUME:
@@ -1065,6 +1108,102 @@ def scan_extended():
     if errors > len(cands) * 0.2:
         log.warning("%s sweep: %d/%d requests errored -- Nasdaq may be throttling",
                     label, errors, len(cands))
+
+
+def _board_key():
+    return now_et().strftime("%Y%m%d") + ":" + session()
+
+
+def board_rows():
+    """Ranked board candidates for whichever session is running now.
+
+    Regular hours come from the market-wide screener, so the ranking is exact.
+    Extended hours have no free market-wide feed -- Nasdaq's screener still
+    reports the last REGULAR print before the open and after the close -- so
+    those boards are built from what our own extended sweep has seen this
+    session. Movers are re-polled every sweep and the rest of the market
+    rotates through, so an extended board is best-effort, not exhaustive.
+    """
+    def eligible(r):
+        return (BOARD_PRICE_MIN <= r["price"] <= BOARD_PRICE_MAX
+                and r["dollar"] >= BOARD_MIN_DOLLAR
+                and r["pct"] is not None
+                and not too_big(r["symbol"]))
+
+    sess = session()
+    if sess == "regular":
+        with _board_lock:
+            if time.time() - _board_pool_ts[0] > 300:
+                return []           # stale screener; skip rather than mislead
+            return [r for r in _board_pool if eligible(r)]
+    if sess not in ("pre", "post"):
+        return []
+    cutoff = time.time() - 1800     # drop anything not seen in 30 minutes
+    rows = []
+    with _board_lock:
+        items = list(_ext_board.items())
+    for sym, (ts, price, pct, dollar) in items:
+        if ts < cutoff:
+            continue
+        r = {"symbol": sym, "price": price, "pct": pct, "dollar": dollar}
+        if eligible(r):
+            rows.append(r)
+    rows.sort(key=lambda d: d["pct"], reverse=True)
+    return rows
+
+
+def _board_line(i, r):
+    return (format(i, "2d") + ". <b>" + html.escape(r["symbol"]) + "</b>  $"
+            + format(r["price"], ",.2f") + "  (" + format(r["pct"], "+.1f") + "%)")
+
+
+def check_top_board():
+    """Post the session's top gainers, then only new entrants after that.
+
+    The rule is do not re-post a name that is already on the board: the full
+    list goes out once when a session's board first forms, and from then on the
+    only messages are names that have newly broken into the top BOARD_N.
+    """
+    sess = session()
+    if sess not in ("pre", "regular", "post"):
+        return
+    # Re-rank every INTERVAL_BOARD, but never make a new session wait for the
+    # timer -- the opening board should land when the session opens.
+    key0 = _board_key()
+    if (key0 == _board_last["key"]
+            and time.time() - _board_last["ts"] < INTERVAL_BOARD):
+        return
+    rows = board_rows()
+    if len(rows) < BOARD_MIN_OPEN:
+        return
+    top = rows[:BOARD_N]
+    key = _board_key()
+    label = {"pre": "PREMARKET", "regular": "REGULAR HOURS",
+             "post": "AFTER-HOURS"}[sess]
+    with _board_lock:
+        already = _board_seen.get(key)
+        first = already is None
+        if first:
+            already = set()
+            _board_seen[key] = already
+        fresh = [r for r in top if r["symbol"] not in already]
+        for r in top:
+            already.add(r["symbol"])
+    _board_last["key"] = key
+    _board_last["ts"] = time.time()
+    if first:
+        body = NEWLINE.join(_board_line(i, r) for i, r in enumerate(top, 1))
+        send_telegram("\U0001F3C6 <b>TOP GAINERS - " + label + "</b>\n" + body)
+        log.info("Board (%s): opened with %d names", sess, len(top))
+        return
+    if not fresh:
+        return
+    body = NEWLINE.join(
+        "<b>" + html.escape(r["symbol"]) + "</b>  $" + format(r["price"], ",.2f")
+        + "  (" + format(r["pct"], "+.1f") + "%)" for r in fresh)
+    send_telegram("\U0001F3C6 <b>NEW ON THE " + label + " TOP "
+                  + str(BOARD_N) + "</b>\n" + body)
+    log.info("Board (%s): %d new entrant(s)", sess, len(fresh))
 
 
 def _watchdog():
@@ -1867,6 +2006,7 @@ def main():
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
         (confirm_edgar,      INTERVAL_EDGAR_OK),
+        (check_top_board,    60),
     ]
     # Kick off the scanners almost immediately so alerts start flowing.
     soon = (scan_market, check_market_news)
@@ -1886,6 +2026,9 @@ def main():
         today = now_et().strftime("%Y%m%d")
         if today != cur_day:
             _seen.clear()
+            with _board_lock:
+                _board_seen.clear()
+                _ext_board.clear()
             cur_day = today
             last_saved_n = 0
             log.info("New trading day %s: cleared de-dup memory", today)
