@@ -275,7 +275,7 @@ BOARD_MIN_DOLLAR   = 250_000       # session turnover needed to be tradeable
 BOARD_POOL_MAX     = 60            # rows kept from each screener pass
 BOARD_MIN_OPEN     = 3             # do not open a board on one lonely name
 INTERVAL_BOARD     = 900           # re-rank every 15 minutes
-BOARD_CONFIRM_MAX  = 20            # extended turnover lookups per re-rank
+WEBULL_QUOTE_MAX   = 40            # tickers per batch quote call
 
 # Webull publishes a market-wide, real-time PREMARKET and AFTER-HOURS gainers
 # ranking in a single call. Nasdaq has no free equivalent -- its screener keeps
@@ -285,6 +285,11 @@ BOARD_CONFIRM_MAX  = 20            # extended turnover lookups per re-rank
 # to the sweep.
 WEBULL_RANK_URL = ("https://quotes-gw.webullfintech.com/api/wlas/ranking/"
                    "topGainers?regionId=6&rankType={rt}&pageIndex=1&pageSize={n}")
+# The ranking gives price and percent but not extended VOLUME, and the liquidity
+# floor needs it. This batch quote endpoint returns pPrice / pChRatio / pVolume
+# for many tickers at once, so confirming the whole board costs one request.
+WEBULL_QUOTE_URL = ("https://quotes-gw.webullfintech.com/api/bgw/quote/realtime"
+                    "?ids={ids}&includeSecu=1&delay=0&more=1")
 WEBULL_PAGE = 60
 WEBULL_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -981,7 +986,6 @@ _board_pool_ts = [0.0]
 _ext_board = {}          # extended sessions: sym -> (ts, price, pct, dollar)
 _board_seen = {}         # "yyyymmdd:session" -> set of symbols already posted
 _board_last = {"key": None, "ts": 0.0}
-_board_vol = {}          # sym -> (ts, extended dollar volume)
 _board_lock = threading.Lock()
 
 
@@ -1153,35 +1157,40 @@ def webull_movers(rank_type):
         if not sym or price is None or ratio is None:
             continue
         out.append({"symbol": sym, "price": price, "pct": ratio * 100.0,
-                    "mcap": _num(t.get("marketValue"))})
+                    "mcap": _num(t.get("marketValue")),
+                    "tickerId": t.get("tickerId")})
     return out
 
 
-def _extended_dollar(sym, markettype, budget):
-    """Extended-session turnover for one symbol. (dollars_or_None, budget_left)
+def webull_quotes(ids):
+    """Batch extended-hours quotes: price, percent AND volume in one call.
 
-    Webull ranks on price alone, so the liquidity floor still has to come from
-    somewhere. Prefer figures our sweep already collected; only spend a request
-    when we have nothing, and never more than BOARD_CONFIRM_MAX per re-rank.
+    The p-prefixed fields are the extended session -- premarket before the open,
+    after-hours after the close -- which is exactly the move each board ranks.
     """
-    now_ts = time.time()
-    with _board_lock:
-        hit = _ext_board.get(sym)
-        cached = _board_vol.get(sym)
-    if hit and now_ts - hit[0] < 900:
-        return hit[3], budget
-    if cached and now_ts - cached[0] < 900:
-        return cached[1], budget
-    if budget <= 0:
-        return None, budget
-    q = fetch_extended(sym, markettype)
-    budget -= 1
-    if not q or q == "ERR":
-        return None, budget
-    dollar = q["price"] * q["volume"]
-    with _board_lock:
-        _board_vol[sym] = (now_ts, dollar)
-    return dollar, budget
+    ids = [str(i) for i in ids if i][:WEBULL_QUOTE_MAX]
+    if not ids:
+        return {}
+    try:
+        r = _http.get(WEBULL_QUOTE_URL.format(ids=",".join(ids)),
+                      headers=WEBULL_HEADERS, timeout=15)
+        if r.status_code != 200:
+            log.warning("Webull quotes HTTP %s", r.status_code)
+            return {}
+        rows = r.json() or []
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Webull quotes failed: %s", e)
+        return {}
+    out = {}
+    for t in rows:
+        sym = (t.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        out[sym] = {"price": _num(t.get("pPrice")),
+                    "pct": _num(t.get("pChRatio")),
+                    "volume": _num(t.get("pVolume")) or 0.0,
+                    "mcap": _num(t.get("marketValue"))}
+    return out
 
 
 def _board_key():
@@ -1212,23 +1221,26 @@ def board_rows():
             return [r for r in _board_pool if eligible(r)]
     if sess not in ("pre", "post"):
         return []
-    markettype = "pre" if sess == "pre" else "post"
     wb = webull_movers("preMarket" if sess == "pre" else "afterMarket")
     if wb:
-        picked, budget = [], BOARD_CONFIRM_MAX
+        quotes = webull_quotes([r.get("tickerId") for r in wb])
+        picked = []
         for r in wb:                    # already ranked by percent, descending
-            if not (BOARD_PRICE_MIN <= r["price"] <= BOARD_PRICE_MAX):
+            q = quotes.get(r["symbol"]) or {}
+            price = q.get("price") or r["price"]
+            pct = q["pct"] * 100.0 if q.get("pct") is not None else r["pct"]
+            mcap = q.get("mcap") if q.get("mcap") is not None else r.get("mcap")
+            if not (BOARD_PRICE_MIN <= price <= BOARD_PRICE_MAX):
                 continue
-            mcap = r.get("mcap")
             if mcap is not None and mcap > MAX_MARKET_CAP:
                 continue
             if too_big(r["symbol"]):
                 continue
-            dollar, budget = _extended_dollar(r["symbol"], markettype, budget)
-            if dollar is None or dollar < BOARD_MIN_DOLLAR:
+            dollar = price * q.get("volume", 0.0)
+            if dollar < BOARD_MIN_DOLLAR:
                 continue
-            picked.append({"symbol": r["symbol"], "price": r["price"],
-                           "pct": r["pct"], "dollar": dollar})
+            picked.append({"symbol": r["symbol"], "price": price,
+                           "pct": pct, "dollar": dollar})
             if len(picked) >= BOARD_N:
                 break
         if picked:
