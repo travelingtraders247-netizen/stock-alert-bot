@@ -275,6 +275,22 @@ BOARD_MIN_DOLLAR   = 250_000       # session turnover needed to be tradeable
 BOARD_POOL_MAX     = 60            # rows kept from each screener pass
 BOARD_MIN_OPEN     = 3             # do not open a board on one lonely name
 INTERVAL_BOARD     = 900           # re-rank every 15 minutes
+BOARD_CONFIRM_MAX  = 20            # extended turnover lookups per re-rank
+
+# Webull publishes a market-wide, real-time PREMARKET and AFTER-HOURS gainers
+# ranking in a single call. Nasdaq has no free equivalent -- its screener keeps
+# reporting the last REGULAR print until the next open -- which is why our
+# extended boards could only ever rank what our own sweep happened to poll.
+# Unofficial endpoint, so every failure is treated as normal and we fall back
+# to the sweep.
+WEBULL_RANK_URL = ("https://quotes-gw.webullfintech.com/api/wlas/ranking/"
+                   "topGainers?regionId=6&rankType={rt}&pageIndex=1&pageSize={n}")
+WEBULL_PAGE = 60
+WEBULL_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+}
 
 # Never block the scheduler for more than this on a Telegram rate-limit, and emit
 # a heartbeat so a silent stall is obvious in the logs.
@@ -965,6 +981,7 @@ _board_pool_ts = [0.0]
 _ext_board = {}          # extended sessions: sym -> (ts, price, pct, dollar)
 _board_seen = {}         # "yyyymmdd:session" -> set of symbols already posted
 _board_last = {"key": None, "ts": 0.0}
+_board_vol = {}          # sym -> (ts, extended dollar volume)
 _board_lock = threading.Lock()
 
 
@@ -1110,6 +1127,63 @@ def scan_extended():
                     label, errors, len(cands))
 
 
+def webull_movers(rank_type):
+    """Market-wide extended-hours gainers, ranked, in one call.
+
+    rank_type is "preMarket" or "afterMarket". Returns [] on any failure, which
+    callers treat as "fall back to our own sweep" rather than as an error.
+    """
+    url = WEBULL_RANK_URL.format(rt=rank_type, n=WEBULL_PAGE)
+    try:
+        r = _http.get(url, headers=WEBULL_HEADERS, timeout=15)
+        if r.status_code != 200:
+            log.warning("Webull %s HTTP %s", rank_type, r.status_code)
+            return []
+        data = (r.json() or {}).get("data") or []
+    except (requests.RequestException, ValueError) as e:
+        log.warning("Webull %s failed: %s", rank_type, e)
+        return []
+    out = []
+    for row in data:
+        t = row.get("ticker") or {}
+        v = row.get("values") or {}
+        sym = (t.get("symbol") or "").strip().upper()
+        price = _num(v.get("price"))
+        ratio = _num(v.get("changeRatio"))
+        if not sym or price is None or ratio is None:
+            continue
+        out.append({"symbol": sym, "price": price, "pct": ratio * 100.0,
+                    "mcap": _num(t.get("marketValue"))})
+    return out
+
+
+def _extended_dollar(sym, markettype, budget):
+    """Extended-session turnover for one symbol. (dollars_or_None, budget_left)
+
+    Webull ranks on price alone, so the liquidity floor still has to come from
+    somewhere. Prefer figures our sweep already collected; only spend a request
+    when we have nothing, and never more than BOARD_CONFIRM_MAX per re-rank.
+    """
+    now_ts = time.time()
+    with _board_lock:
+        hit = _ext_board.get(sym)
+        cached = _board_vol.get(sym)
+    if hit and now_ts - hit[0] < 900:
+        return hit[3], budget
+    if cached and now_ts - cached[0] < 900:
+        return cached[1], budget
+    if budget <= 0:
+        return None, budget
+    q = fetch_extended(sym, markettype)
+    budget -= 1
+    if not q or q == "ERR":
+        return None, budget
+    dollar = q["price"] * q["volume"]
+    with _board_lock:
+        _board_vol[sym] = (now_ts, dollar)
+    return dollar, budget
+
+
 def _board_key():
     return now_et().strftime("%Y%m%d") + ":" + session()
 
@@ -1138,6 +1212,34 @@ def board_rows():
             return [r for r in _board_pool if eligible(r)]
     if sess not in ("pre", "post"):
         return []
+    markettype = "pre" if sess == "pre" else "post"
+    wb = webull_movers("preMarket" if sess == "pre" else "afterMarket")
+    if wb:
+        picked, budget = [], BOARD_CONFIRM_MAX
+        for r in wb:                    # already ranked by percent, descending
+            if not (BOARD_PRICE_MIN <= r["price"] <= BOARD_PRICE_MAX):
+                continue
+            mcap = r.get("mcap")
+            if mcap is not None and mcap > MAX_MARKET_CAP:
+                continue
+            if too_big(r["symbol"]):
+                continue
+            dollar, budget = _extended_dollar(r["symbol"], markettype, budget)
+            if dollar is None or dollar < BOARD_MIN_DOLLAR:
+                continue
+            picked.append({"symbol": r["symbol"], "price": r["price"],
+                           "pct": r["pct"], "dollar": dollar})
+            if len(picked) >= BOARD_N:
+                break
+        if picked:
+            # Anything ranking market-wide deserves a front-of-queue probe on
+            # the next sweep, so the runner alerts see it too.
+            for r in picked:
+                _catalyst.add(r["symbol"])
+            return picked
+        log.info("Board (%s): Webull gave %d rows, none cleared the filters; "
+                 "falling back to the sweep", sess, len(wb))
+
     cutoff = time.time() - 1800     # drop anything not seen in 30 minutes
     rows = []
     with _board_lock:
