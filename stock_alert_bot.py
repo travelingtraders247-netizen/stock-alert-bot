@@ -55,7 +55,9 @@ import sys
 import json
 import time
 import html
+import queue
 import logging
+import logging.handlers
 import threading
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
@@ -276,7 +278,33 @@ _last_tick = [time.time()]
 
 DRY_RUN = "--test" in sys.argv
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# --- Non-blocking logging ---------------------------------------------------
+# Railway reads our stdout through a pipe with a finite buffer, and we run
+# unbuffered (python -u). If the platform ever stops draining that pipe, the
+# next write() blocks -- and since every thread logs, EVERY thread stops at
+# once, with the container still reporting ACTIVE and no crash to restart.
+# That is the exact signature of the 29-hour silent freeze on 2026-08-30.
+# Records now go onto a bounded queue that DROPS when full, so a stalled log
+# consumer costs us log lines instead of costing us the trading loops.
+_log_q = queue.Queue(maxsize=5000)
+
+
+class _DropWhenFull(logging.handlers.QueueHandler):
+    """Never block a worker thread just to emit a log line."""
+
+    def enqueue(self, record):
+        try:
+            self.queue.put_nowait(record)
+        except queue.Full:
+            pass
+
+
+_log_stream = logging.StreamHandler(sys.stdout)
+_log_stream.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_DropWhenFull(_log_q)])
+_log_listener = logging.handlers.QueueListener(_log_q, _log_stream)
+_log_listener.start()
 log = logging.getLogger("alertbot")
 
 # De-dup memory so the same event isn't posted twice.
@@ -1032,18 +1060,23 @@ def _watchdog():
 
     Exiting non-zero triggers Railway's restart-on-failure policy, so a wedge
     costs ~10 minutes of downtime instead of silently lasting all day.
+
+    This must NEVER touch the logger. The previous version logged its warning
+    first and blocked on that very write for 29 hours on 2026-08-30 -- the one
+    thread whose job was to rescue us was the one thing the wedge could stop.
     """
     while True:
-        time.sleep(60)
-        stalled = time.time() - _last_tick[0]
-        if stalled > WATCHDOG_TIMEOUT:
-            log.critical("WATCHDOG: main loop stalled %.0fs -- exiting for restart",
-                         stalled)
-            try:
-                sys.stderr.flush()
-            except Exception:  # noqa: BLE001
-                pass
-            os._exit(1)
+        time.sleep(30)
+        if time.time() - _last_tick[0] <= WATCHDOG_TIMEOUT:
+            continue
+        # Guarantee the exit even if the raw write below blocks too.
+        threading.Thread(target=lambda: (time.sleep(5), os._exit(1)),
+                         daemon=True).start()
+        try:
+            os.write(2, b"WATCHDOG: main loop stalled -- exiting for restart\n")
+        except OSError:
+            pass
+        os._exit(1)
 
 
 def _extended_loop():
