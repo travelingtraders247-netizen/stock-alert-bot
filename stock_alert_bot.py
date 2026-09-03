@@ -276,6 +276,7 @@ BOARD_POOL_MAX     = 60            # rows kept from each screener pass
 BOARD_MIN_OPEN     = 3             # do not open a board on one lonely name
 INTERVAL_BOARD     = 900           # re-rank every 15 minutes
 WEBULL_QUOTE_MAX   = 40            # tickers per batch quote call
+INTERVAL_WEBULL    = 60            # extended-hours alert pass off Webull
 
 # Webull publishes a market-wide, real-time PREMARKET and AFTER-HOURS gainers
 # ranking in a single call. Nasdaq has no free equivalent -- its screener keeps
@@ -1189,8 +1190,76 @@ def webull_quotes(ids):
         out[sym] = {"price": _num(t.get("pPrice")),
                     "pct": _num(t.get("pChRatio")),
                     "volume": _num(t.get("pVolume")) or 0.0,
-                    "mcap": _num(t.get("marketValue"))}
+                    "mcap": _num(t.get("marketValue")),
+                    # 3-month average daily volume: an RVOL baseline that costs
+                    # nothing, instead of a Nasdaq historical call per symbol.
+                    "avgvol": _num(t.get("avgVol3M"))}
     return out
+
+
+def scan_extended_webull():
+    """Extended-hours runner and volume alerts off Webull's real-time ranking.
+
+    Nasdaq's per-symbol extended endpoint cannot be trusted on its own: at 16:13
+    ET on 2026-08-31 it reported "no extended trades" for all 765 symbols we
+    polled -- zero HTTP errors, just nothing -- while Webull showed LABT +45% on
+    2.1M shares. The Nasdaq sweep still runs and still feeds the board, but it is
+    no longer the only thing that can raise an extended-hours alert.
+
+    De-dup keys are identical to the sweep's, so whichever source sees a move
+    first wins and the other cannot alert it twice.
+    """
+    sess = session()
+    if sess not in ("pre", "post"):
+        return
+    markettype = "pre" if sess == "pre" else "post"
+    label = "PREMARKET" if sess == "pre" else "AFTER-HOURS"
+    wb = webull_movers("preMarket" if sess == "pre" else "afterMarket")
+    if not wb:
+        return
+    quotes = webull_quotes([r.get("tickerId") for r in wb])
+    day = now_et().strftime("%Y%m%d")
+    runners = heavy = 0
+    for r in wb:
+        sym = r["symbol"]
+        q = quotes.get(sym) or {}
+        price = q.get("price") or r["price"]
+        pct = q["pct"] * 100.0 if q.get("pct") is not None else r["pct"]
+        vol = q.get("volume") or 0.0
+        mcap = q.get("mcap") if q.get("mcap") is not None else r.get("mcap")
+        if price is None or price < PRICE_MIN or price > PRICE_MAX:
+            continue
+        if mcap is not None and mcap > MAX_MARKET_CAP:
+            continue
+        if too_big(sym):
+            continue
+        if pct >= PM_MIN_PERCENT and vol >= PM_MIN_VOLUME:
+            tier = int(pct // 50)       # re-alert only on a materially bigger move
+            if once("ext:" + markettype + ":" + sym + ":" + day + ":" + str(tier)):
+                _catalyst.add(sym)
+                send_telegram(
+                    "\U0001F680 <b>" + label + " RUNNER</b>\n"
+                    + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
+                    + " \U0001F4C8")
+                runners += 1
+            continue
+        # Heavy extended turnover without the big price move yet.
+        base = q.get("avgvol")
+        if not base or vol < EXT_RVOL_MIN_SHARES:
+            continue
+        rv = vol / base
+        if rv < EXT_RVOL_MIN:
+            continue
+        if once("extvol:" + markettype + ":" + sym + ":" + day):
+            _catalyst.add(sym)
+            send_telegram(
+                "\U0001F50A <b>" + label + " VOLUME</b>\n"
+                + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
+                + "  " + format(rv, ",.1f") + "x daily vol")
+            heavy += 1
+    if runners or heavy:
+        log.info("Webull %s: %d runner(s), %d volume alert(s) out of %d ranked",
+                 label, runners, heavy, len(wb))
 
 
 def _board_key():
@@ -2121,6 +2190,7 @@ def main():
         (check_volume_surge, INTERVAL_VOLROLL),
         (confirm_edgar,      INTERVAL_EDGAR_OK),
         (check_top_board,    60),
+        (scan_extended_webull, INTERVAL_WEBULL),
     ]
     # Kick off the scanners almost immediately so alerts start flowing.
     soon = (scan_market, check_market_news)
