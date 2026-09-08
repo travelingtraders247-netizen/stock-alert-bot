@@ -253,14 +253,23 @@ NEWS_WINDOW_SEC  = 86400
 # move nothing. A queued filing only becomes an alert once the tape confirms it:
 # the ticker has to be up meaningfully, or turning over unusual volume, or
 # already flagged by another alert today. Unconfirmed filings expire quietly.
-EDGAR_MIN_PCT      = 7.0           # move that counts as confirmation on its own
-EDGAR_MIN_RVOL     = 2.0           # ...or this much of a normal day's volume
-EDGAR_PENDING_SEC  = 21600         # hold an unconfirmed filing 6h, then drop it
-EDGAR_MAX_PENDING  = 300
-EDGAR_RVOL_LOOKUPS = 10            # baseline fetches per confirmation pass
 EDGAR_TIMEOUT      = 30            # browse-edgar is slow; 20s timed out
 INTERVAL_EDGAR     = 300
-INTERVAL_EDGAR_OK  = 120
+
+# --- Catalyst confirmation ---------------------------------------------------
+# NO catalyst -- news, PR wire or SEC filing -- is sent on the headline alone.
+# Every one is queued silently and only released once the tape confirms it with
+# BOTH a real price surge and a real volume surge. A headline on a stock that
+# is not moving is not a trade, and it was the bulk of the channel's noise.
+# News often breaks minutes ahead of the move, so a queued catalyst is
+# re-checked every couple of minutes and fires the moment both land. If neither
+# ever lands, it expires unseen.
+CATALYST_MIN_PCT      = 7.0        # price surge required
+CATALYST_MIN_RVOL     = 2.0        # AND this much of a normal day's volume
+CATALYST_PENDING_SEC  = 21600      # hold an unconfirmed catalyst 6h, then drop
+CATALYST_MAX_PENDING  = 400
+CATALYST_RVOL_LOOKUPS = 12         # baseline fetches per confirmation pass
+INTERVAL_CATALYST     = 120
 
 # --- Top-10 gainers board ----------------------------------------------------
 # A leaderboard of the biggest percentage gainers, run separately for each
@@ -1218,6 +1227,12 @@ def scan_extended_webull():
     if not wb:
         return
     quotes = webull_quotes([r.get("tickerId") for r in wb])
+    # Extended-hours catalyst confirmation reads this instead of making its own
+    # calls: outside regular hours the Nasdaq screener is blind, and this pass
+    # already has live percent, volume and an average-volume baseline.
+    with _cat_lock:
+        _wb_cache["ts"] = time.time()
+        _wb_cache["quotes"] = quotes
     day = now_et().strftime("%Y%m%d")
     runners = heavy = 0
     for r in wb:
@@ -1582,10 +1597,62 @@ def tickers_in(text):
 
 
 def _news_alert(sym, headline, source, url, tag="NEWS"):
-    if too_big(sym):        # fleet-wide market-cap gate
+    """Queue a catalyst. Nothing is sent here -- see confirm_catalysts()."""
+    if too_big(sym):                # fleet-wide market-cap gate
         return False
     if not is_english(headline):    # English-only channel
         return False
+    with _cat_lock:
+        if sym in _cat_pending:     # first headline per ticker wins
+            return False
+        if len(_cat_pending) >= CATALYST_MAX_PENDING:
+            return False
+        _cat_pending[sym] = (time.time(), headline, tag)
+    return True
+
+
+def catalyst_confirmed(sym, budget):
+    """Is this name surging on real volume right now? (ok, price, budget_left)
+
+    Requires BOTH: at least CATALYST_MIN_PCT up AND at least CATALYST_MIN_RVOL
+    times a normal day's volume. Either one alone is not a catalyst, it is a
+    coincidence.
+    """
+    sess = session()
+    if sess in ("pre", "post"):
+        # The screener still reports the last REGULAR print outside market
+        # hours, so extended confirmation has to come from the Webull snapshot.
+        with _cat_lock:
+            fresh = time.time() - _wb_cache["ts"] < 300
+            q = dict(_wb_cache["quotes"].get(sym) or {}) if fresh else {}
+        if not q:
+            return False, None, budget
+        base = q.get("avgvol")
+        vol = q.get("volume") or 0.0
+        pct = (q.get("pct") or 0.0) * 100.0
+        if not base or pct < CATALYST_MIN_PCT:
+            return False, None, budget
+        if (vol / base) < CATALYST_MIN_RVOL:
+            return False, None, budget
+        return True, q.get("price"), budget
+    if sess != "regular":
+        return False, None, budget
+    with _universe_lock:
+        info = dict(_universe.get(sym) or {})
+    pct = info.get("pct") or 0.0
+    vol = info.get("vol") or 0.0
+    if pct < CATALYST_MIN_PCT:      # free check first, before spending a lookup
+        return False, None, budget
+    if budget <= 0:
+        return False, None, budget
+    base = avg_daily_volume(sym)
+    budget -= 1
+    if not base or (vol / base) < CATALYST_MIN_RVOL:
+        return False, None, budget
+    return True, info.get("close"), budget
+
+
+def _send_catalyst(sym, headline, tag, price):
     # Rolling 24h throttle: the same story reaches us from several wires under
     # different ids, so cap catalyst alerts per ticker regardless of source.
     now_ts = time.time()
@@ -1593,17 +1660,45 @@ def _news_alert(sym, headline, source, url, tag="NEWS"):
     if len(hist) >= NEWS_MAX_PER_24H:
         _news_hist[sym] = hist
         return False
-    with _universe_lock:
-        info = _universe.get(sym) or {}
-    px = info.get("close")
-    price_str = ("  $" + format(px, ",.2f")) if px else ""
+    if price is None:
+        with _universe_lock:
+            price = (_universe.get(sym) or {}).get("close")
+    price_str = ("  $" + format(price, ",.2f")) if price else ""
     send_telegram(
         "\U0001F4F0 <b>" + tag + "</b>  <b>" + html.escape(sym) + "</b>" + price_str + "\n"
         + html.escape(headline[:250])
     )
     hist.append(now_ts)
     _news_hist[sym] = hist
+    _catalyst.add(sym)
     return True
+
+
+def confirm_catalysts():
+    """Release queued catalysts whose stock is now surging on real volume."""
+    with _cat_lock:
+        pending = dict(_cat_pending)
+    if not pending:
+        return
+    now_ts = time.time()
+    done, sent, budget = [], 0, CATALYST_RVOL_LOOKUPS
+    for sym, (ts, headline, tag) in sorted(pending.items()):
+        if now_ts - ts > CATALYST_PENDING_SEC:
+            done.append(sym)            # never confirmed; drop it unseen
+            continue
+        ok, price, budget = catalyst_confirmed(sym, budget)
+        if not ok:
+            continue
+        if _send_catalyst(sym, headline, tag, price):
+            sent += 1
+        done.append(sym)
+    if done:
+        with _cat_lock:
+            for s in done:
+                _cat_pending.pop(s, None)
+    if sent:
+        log.info("Catalysts: %d confirmed on price + volume (%d still queued)",
+                 sent, len(_cat_pending))
 
 
 def check_market_news():
@@ -1686,8 +1781,11 @@ SEC_HEADERS = {"User-Agent": SEC_CONTACT, "Accept-Encoding": "gzip, deflate"}
 
 _CIK_RE = re.compile(r"\((\d{7,10})\)")
 _cik_map = {}            # {"day": yyyymmdd, "map": {cik_int: ticker}}
-_edgar_pending = {}      # sym -> (first_seen_ts, form, company_name)
-_edgar_lock = threading.Lock()
+
+# Every unconfirmed catalyst, whatever its source, waits here.
+_cat_pending = {}        # sym -> (first_seen_ts, headline, tag)
+_cat_lock = threading.Lock()
+_wb_cache = {"ts": 0.0, "quotes": {}}   # last Webull extended snapshot
 
 
 def sec_ticker_map():
@@ -1757,13 +1855,12 @@ def poll_edgar():
                 continue
             name = title.split(" - ", 1)[1] if " - " in title else title
             name = _CIK_RE.sub("", name).replace("(Filer)", "").strip(" -")
-            with _edgar_lock:
-                if len(_edgar_pending) < EDGAR_MAX_PENDING:
-                    _edgar_pending[sym] = (time.time(), form, name)
-            queued += 1
+            if _news_alert(sym, _sec_headline(form, name), "SEC EDGAR", "",
+                           tag="SEC FILING"):
+                queued += 1
     if queued:
-        log.info("EDGAR: %d filings queued (%d awaiting confirmation)",
-                 queued, len(_edgar_pending))
+        log.info("EDGAR: %d filings queued (%d catalysts awaiting confirmation)",
+                 queued, len(_cat_pending))
 
 
 def _edgar_loop():
@@ -1779,54 +1876,6 @@ def _edgar_loop():
         except Exception as e:  # noqa: BLE001
             log.error("poll_edgar failed: %s", e)
         time.sleep(max(30, INTERVAL_EDGAR - (time.time() - started)))
-
-
-def confirm_edgar():
-    """Alert a queued filing only once the stock is actually doing something.
-
-    Confirmation is any ONE of: a real move up, unusual turnover, or the ticker
-    already being flagged by another alert today. No move, no alert -- the
-    filing simply expires. Downside moves never confirm.
-    """
-    with _edgar_lock:
-        pending = dict(_edgar_pending)
-    if not pending:
-        return
-    now_ts = time.time()
-    done = [s for s, (ts, _f, _n) in pending.items()
-            if now_ts - ts > EDGAR_PENDING_SEC]
-    lookups = 0
-    sent = 0
-    for sym, (ts, form, name) in sorted(pending.items()):
-        if sym in done:
-            continue
-        with _universe_lock:
-            info = dict(_universe.get(sym) or {})
-        pct = info.get("pct") or 0.0
-        vol = info.get("vol") or 0.0
-        if pct < 0:
-            continue                    # never alert a filing into a decline
-        ok = pct >= EDGAR_MIN_PCT
-        if not ok and (sym in _catalyst or sym in _watchlist):
-            ok = True                   # already moving on another signal today
-        if not ok and vol >= RVOL_MIN_SHARES and lookups < EDGAR_RVOL_LOOKUPS:
-            base = avg_daily_volume(sym)
-            lookups += 1
-            ok = bool(base) and (vol / base) >= EDGAR_MIN_RVOL
-        if not ok:
-            continue
-        if _news_alert(sym, _sec_headline(form, name), "SEC EDGAR", "",
-                       tag="SEC FILING"):
-            sent += 1
-        _catalyst.add(sym)
-        done.append(sym)
-    if done:
-        with _edgar_lock:
-            for s in done:
-                _edgar_pending.pop(s, None)
-    if sent:
-        log.info("EDGAR: %d filings confirmed by the tape (%d still pending)",
-                 sent, len(_edgar_pending))
 
 
 def parse_extended_raw(payload):
@@ -2188,7 +2237,7 @@ def main():
         (check_new_listings, INTERVAL_NEWLIST),
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
-        (confirm_edgar,      INTERVAL_EDGAR_OK),
+        (confirm_catalysts,  INTERVAL_CATALYST),
         (check_top_board,    60),
         (scan_extended_webull, INTERVAL_WEBULL),
     ]
