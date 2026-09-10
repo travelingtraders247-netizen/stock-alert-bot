@@ -271,6 +271,17 @@ CATALYST_MAX_PENDING  = 400
 CATALYST_RVOL_LOOKUPS = 12         # baseline fetches per confirmation pass
 INTERVAL_CATALYST     = 120
 
+# --- Repeat-halt throttle ----------------------------------------------------
+# A volatile name can pause over and over in one session -- WETO halted seven
+# times in a day. The first two halts in a rolling 24h always alert. After that
+# the stock has to prove it is actually going somewhere: BOTH a bullish move and
+# materially more volume than at the first alert of that window. A stock just
+# chopping in and out of halts goes quiet.
+HALT_MAX_PER_24H     = 2
+HALT_WINDOW_SEC      = 86400
+HALT_REPEAT_MIN_PCT  = 7.0         # above the price at the first alert
+HALT_REPEAT_VOL_MULT = 2.0         # AND this many times its volume back then
+
 # --- Top-10 gainers board ----------------------------------------------------
 # A leaderboard of the biggest percentage gainers, run separately for each
 # session (premarket / regular / after-hours) so each board reflects that
@@ -1785,6 +1796,11 @@ _cik_map = {}            # {"day": yyyymmdd, "map": {cik_int: ticker}}
 # Every unconfirmed catalyst, whatever its source, waits here.
 _cat_pending = {}        # sym -> (first_seen_ts, headline, tag)
 _cat_lock = threading.Lock()
+
+# Repeat-halt state.
+_halt_hist = {}          # sym -> {"ts": [...], "px0": float, "vol0": float}
+_halt_muted = set()      # "sym:stamp" halts we skipped, so RESUMED is skipped too
+_halt_lock = threading.Lock()
 _wb_cache = {"ts": 0.0, "quotes": {}}   # last Webull extended snapshot
 
 
@@ -2034,6 +2050,49 @@ def _resume_epoch(rdate, rtime):
         return None
 
 
+def _session_volume(sym):
+    """Best-effort volume so far in the current session."""
+    if session() in ("pre", "post"):
+        with _cat_lock:
+            if time.time() - _wb_cache["ts"] < 600:
+                q = _wb_cache["quotes"].get(sym) or {}
+                if q.get("volume"):
+                    return q["volume"]
+    with _universe_lock:
+        return (_universe.get(sym) or {}).get("vol")
+
+
+def halt_allowed(sym, px):
+    """Should this halt alert, given how often the name has already halted?
+
+    First HALT_MAX_PER_24H halts in a rolling 24h always alert. Beyond that we
+    require BOTH a bullish move and real volume expansion versus the first alert
+    of the window -- otherwise it is the same stock chopping, not a new event.
+    """
+    now_ts = time.time()
+    vol = _session_volume(sym)
+    with _halt_lock:
+        h = _halt_hist.get(sym)
+        if h:
+            h["ts"] = [t for t in h["ts"] if now_ts - t < HALT_WINDOW_SEC]
+        if not h or not h["ts"]:
+            # Window empty: this halt becomes the new baseline to measure against.
+            h = {"ts": [], "px0": px, "vol0": vol}
+            _halt_hist[sym] = h
+        if len(h["ts"]) < HALT_MAX_PER_24H:
+            h["ts"].append(now_ts)
+            return True
+        px0, vol0 = h.get("px0"), h.get("vol0")
+        if not px0 or px is None:
+            return False                # nothing to compare against; stay quiet
+        if ((px - px0) / px0 * 100.0) < HALT_REPEAT_MIN_PCT:
+            return False                # not bullish enough versus the first alert
+        if not vol0 or not vol or (vol / vol0) < HALT_REPEAT_VOL_MULT:
+            return False                # volume has not expanded
+        h["ts"].append(now_ts)
+        return True
+
+
 def check_halts():
     if feedparser is None:
         return
@@ -2064,8 +2123,11 @@ def check_halts():
         if rdate and rtime:
             rts = _resume_epoch(rdate, rtime)
             if rts is not None and time.time() >= rts:
+                muted = (sym + ":" + stamp) in _halt_muted
                 if once("resume:" + sym + ":" + stamp) and not _silent:
-                    if not too_big(sym):
+                    # If we suppressed the halt, suppress its reopen too --
+                    # a lone RESUMED with no HALT reads as a glitch.
+                    if not too_big(sym) and not muted:
                         rpx = current_price(sym)
                         rstr = ("  $" + format(rpx, ",.2f")) if rpx else ""
                         send_telegram(
@@ -2087,6 +2149,11 @@ def check_halts():
             continue
         _catalyst.add(sym)            # halted names are prime premarket candidates
         px = current_price(sym)
+        if not halt_allowed(sym, px):
+            _halt_muted.add(sym + ":" + stamp)
+            log.info("Halt %s suppressed: repeat halt with no bullish move and "
+                     "no volume expansion since the first alert", sym)
+            continue
         price_str = ("  $" + format(px, ",.2f")) if px else ""
         code = (entry.get("ndaq_reasoncode") or "").strip().upper()
         reason = ""
@@ -2262,6 +2329,9 @@ def main():
             with _board_lock:
                 _board_seen.clear()
                 _ext_board.clear()
+            with _halt_lock:
+                _halt_hist.clear()
+            _halt_muted.clear()
             cur_day = today
             last_saved_n = 0
             log.info("New trading day %s: cleared de-dup memory", today)
