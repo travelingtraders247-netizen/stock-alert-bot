@@ -386,6 +386,110 @@ _news_hist = defaultdict(list)
 # Optional on-disk de-dup so a redeploy doesn't re-post the same alerts.
 SEEN_PATH = (_env("DEDUP_PATH")
              or ("/data/seen.json" if os.path.isdir("/data") else "seen_state.json"))
+LEDGER_DIR = "/data" if os.path.isdir("/data") else "."
+
+# --- Alert ledger ------------------------------------------------------------
+# Telegram gives a bot no way to read back its own channel, so without this there
+# is no record of WHAT was alerted and WHEN. The ledger keeps the first alert per
+# ticker per day and prints a compact digest once after-hours closes, which the
+# end-of-day review reads to measure how much of each run we actually caught.
+_ledger = {}             # sym -> {"ts", "type", "px"}
+_ledger_lock = threading.Lock()
+_ledger_day = [""]
+_ledger_dirty = [False]
+_ledger_digest_done = [""]
+# The board is a digest of names already ranked elsewhere, not a call to action,
+# so it must never count as "we alerted this" or the review grades itself.
+_LEDGER_SKIP = ("TOP GAINERS", "NEW ON THE")
+_B_RE = re.compile(r"<b>(.*?)</b>", re.S)
+_LEDGER_PX_RE = re.compile(r"\$([\d,]+\.?\d*)")
+_TICKER_OK = re.compile(r"[A-Z][A-Z0-9.\-]{0,7}$")
+
+
+def _ledger_path(day):
+    return os.path.join(LEDGER_DIR, "ledger-" + day + ".json")
+
+
+def _ledger_load(day):
+    try:
+        with open(_ledger_path(day)) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            with _ledger_lock:
+                _ledger.clear()
+                _ledger.update(data)
+            log.info("Ledger: restored %d alerted tickers for %s", len(data), day)
+    except (OSError, ValueError):
+        pass
+
+
+def _ledger_save():
+    if not _ledger_dirty[0]:
+        return
+    day = _ledger_day[0]
+    if not day:
+        return
+    try:
+        with _ledger_lock:
+            data = dict(_ledger)
+            _ledger_dirty[0] = False
+        tmp = _ledger_path(day) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _ledger_path(day))
+    except OSError as e:
+        log.warning("Could not save ledger: %s", e)
+
+
+def _ledger_record(text):
+    """Record the first alert of the day for a ticker, parsed from the message."""
+    try:
+        day = now_et().strftime("%Y%m%d")
+        if _ledger_day[0] != day:
+            _ledger_day[0] = day
+            with _ledger_lock:
+                _ledger.clear()
+            _ledger_load(day)
+        parts = _B_RE.findall(text)
+        if len(parts) < 2:
+            return
+        kind = parts[0].strip()
+        if any(kind.startswith(x) for x in _LEDGER_SKIP):
+            return
+        sym = parts[1].strip().upper()
+        if not _TICKER_OK.match(sym):
+            return
+        with _ledger_lock:
+            if sym in _ledger:      # first alert of the day is the one that counts
+                return
+            pm = _LEDGER_PX_RE.search(text)
+            _ledger[sym] = {
+                "ts": now_et().strftime("%H:%M:%S"),
+                "type": kind,
+                "px": pm.group(1).replace(",", "") if pm else "",
+            }
+            _ledger_dirty[0] = True
+    except Exception as e:  # noqa: BLE001 - the ledger must never break an alert
+        log.warning("Ledger record failed: %s", e)
+
+
+def ledger_digest():
+    """After after-hours closes, print the day's first-alert table to the log."""
+    n = now_et()
+    day = n.strftime("%Y%m%d")
+    if _ledger_digest_done[0] == day:
+        return
+    if n.weekday() >= 5 or (n.hour * 60 + n.minute) < 20 * 60:
+        return
+    _ledger_digest_done[0] = day
+    _ledger_save()
+    with _ledger_lock:
+        rows = sorted(_ledger.items(), key=lambda kv: kv[1].get("ts", ""))
+    log.info("LEDGER %s begin", day)
+    for sym, r in rows:
+        log.info("LEDGER %s %s %s $%s", day, r.get("ts", ""), sym,
+                 r.get("px", "") or "-")
+    log.info("LEDGER %s end (%d tickers alerted)", day, len(rows))
 
 
 def _load_seen():
@@ -490,6 +594,7 @@ def send_telegram(text):
     """Send an HTML message to Telegram, paced so we never trip the flood limit."""
     if _silent:
         return
+    _ledger_record(text)
     if DRY_RUN:
         print("\n--- ALERT (dry run) ---\n" + text + "\n-----------------------")
         return
@@ -2305,6 +2410,7 @@ def main():
         (check_halts,        INTERVAL_HALTS),
         (check_volume_surge, INTERVAL_VOLROLL),
         (confirm_catalysts,  INTERVAL_CATALYST),
+        (ledger_digest,      60),
         (check_top_board,    60),
         (scan_extended_webull, INTERVAL_WEBULL),
     ]
