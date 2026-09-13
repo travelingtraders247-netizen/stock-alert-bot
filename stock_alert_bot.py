@@ -2201,6 +2201,11 @@ def halt_allowed(sym, px):
 def check_halts():
     if feedparser is None:
         return
+    # Halts only mean something while a session is running. Outside 4:00-20:00 ET
+    # and all weekend we still READ the feed and record its ids -- otherwise the
+    # first poll of Monday's premarket would blast Friday's entire backlog -- but
+    # nothing is sent.
+    quiet = session() not in ("pre", "regular", "post")
     try:
         feed = feedparser.parse(NASDAQ_HALT_RSS)
     except Exception as e:  # noqa: BLE001
@@ -2229,7 +2234,7 @@ def check_halts():
             rts = _resume_epoch(rdate, rtime)
             if rts is not None and time.time() >= rts:
                 muted = (sym + ":" + stamp) in _halt_muted
-                if once("resume:" + sym + ":" + stamp) and not _silent:
+                if once("resume:" + sym + ":" + stamp) and not (_silent or quiet):
                     # If we suppressed the halt, suppress its reopen too --
                     # a lone RESUMED with no HALT reads as a glitch.
                     if not too_big(sym) and not muted:
@@ -2244,8 +2249,8 @@ def check_halts():
                                      or entry.get("link") or "")
         if not once(eid):
             continue
-        if _silent:
-            continue        # priming a redeploy: record the id, don't fetch or send
+        if _silent or quiet:
+            continue        # record the id, but don't fetch or send
         with _universe_lock:
             unknown = sym not in _universe and sym not in _mcap_all
         if unknown:
