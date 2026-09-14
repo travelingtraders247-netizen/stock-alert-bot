@@ -745,6 +745,40 @@ def avg_daily_volume(sym):
     return day_context(sym)[1]
 
 
+_vol_alert_px = {}       # sym -> (yyyymmdd, highest price we have alerted on)
+_vol_alert_lock = threading.Lock()
+
+
+def send_volume_alert(sym, px, header, extra=""):
+    """Volume alert that never re-quotes a ticker at a LOWER price than before.
+
+    FTFT went out at $8.14 and again twelve minutes later at $7.50. Printing the
+    lower number reads like a fresh setup when the move has actually faded, so a
+    repeat below the last alerted price drops the price and the multiple and
+    simply says volume is coming in.
+    """
+    day = now_et().strftime("%Y%m%d")
+    faded = False
+    with _vol_alert_lock:
+        prev = _vol_alert_px.get(sym)
+        if prev and prev[0] != day:
+            prev = None                 # new session, new high-water mark
+        if px is None:
+            faded = prev is not None
+        elif prev is not None and px < prev[1]:
+            faded = True
+        else:
+            _vol_alert_px[sym] = (day, px)
+    if faded:
+        send_telegram("\U0001F50A <b>VOLUME COMING IN</b>\n"
+                      + "<b>" + html.escape(sym) + "</b>")
+        return
+    price_str = ("  $" + format(px, ",.2f")) if px else ""
+    send_telegram("\U0001F50A <b>" + header + "</b>\n"
+                  + "<b>" + html.escape(sym) + "</b>" + price_str
+                  + (extra if px else ""))
+
+
 def too_big(sym):
     """Fleet-wide gate: True if this company exceeds MAX_MARKET_CAP.
 
@@ -975,11 +1009,8 @@ def scan_market():
         if not once("unusual:" + sym + ":" + day):
             continue
         _catalyst.add(sym)          # worth watching in the next extended sweep
-        send_telegram(
-            "\U0001F50A <b>UNUSUAL VOLUME</b>\n"
-            + "<b>" + html.escape(sym) + "</b>  $" + format(u["price"], ",.2f")
-            + "  " + format(u["rvol"], ",.0f") + "x avg vol"
-        )
+        send_volume_alert(sym, u["price"], "UNUSUAL VOLUME",
+                          "  " + format(u["rvol"], ",.0f") + "x avg vol")
 
     if not movers:
         return
@@ -1226,11 +1257,8 @@ def scan_extended():
         if not once("extvol:" + markettype + ":" + sym + ":" + day):
             continue
         _catalyst.add(sym)
-        send_telegram(
-            "\U0001F50A <b>" + label + " VOLUME</b>\n"
-            + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
-            + "  " + format(rv, ",.1f") + "x daily vol"
-        )
+        send_volume_alert(sym, price, label + " VOLUME",
+                          "  " + format(rv, ",.1f") + "x daily vol")
 
     hits.sort(key=lambda h: h[0], reverse=True)   # biggest movers alert first
     sent = 0
@@ -1383,10 +1411,8 @@ def scan_extended_webull():
             continue
         if once("extvol:" + markettype + ":" + sym + ":" + day):
             _catalyst.add(sym)
-            send_telegram(
-                "\U0001F50A <b>" + label + " VOLUME</b>\n"
-                + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
-                + "  " + format(rv, ",.1f") + "x daily vol")
+            send_volume_alert(sym, price, label + " VOLUME",
+                              "  " + format(rv, ",.1f") + "x daily vol")
             heavy += 1
     if runners or heavy:
         log.info("Webull %s: %d runner(s), %d volume alert(s) out of %d ranked",
@@ -2360,11 +2386,7 @@ def check_volume_surge():
         if px is None:                      # WS price missing -> fall back to close
             with _universe_lock:
                 px = (_universe.get(sym) or {}).get("close")
-        price_str = ("  $" + format(px, ",.2f")) if px else ""
-        send_telegram(
-            "\U0001F50A <b>VOLUME SURGE</b>\n"
-            + "<b>" + html.escape(sym) + "</b>" + price_str
-        )
+        send_volume_alert(sym, px, "VOLUME SURGE")
 
 
 # ----------------------------------------------------------------------
@@ -2443,6 +2465,8 @@ def main():
             with _halt_lock:
                 _halt_hist.clear()
             _halt_muted.clear()
+            with _vol_alert_lock:
+                _vol_alert_px.clear()
             cur_day = today
             last_saved_n = 0
             log.info("New trading day %s: cleared de-dup memory", today)
