@@ -745,7 +745,10 @@ def avg_daily_volume(sym):
     return day_context(sym)[1]
 
 
+VOL_FADED_COOLDOWN = 600  # min seconds between repeat "volume coming in" notes
+
 _vol_alert_px = {}       # sym -> (yyyymmdd, highest price we have alerted on)
+_vol_faded_ts = {}       # sym -> epoch of the last "volume coming in" note
 _vol_alert_lock = threading.Lock()
 
 
@@ -758,6 +761,7 @@ def send_volume_alert(sym, px, header, extra=""):
     simply says volume is coming in.
     """
     day = now_et().strftime("%Y%m%d")
+    now_ts = time.time()
     faded = False
     with _vol_alert_lock:
         prev = _vol_alert_px.get(sym)
@@ -769,6 +773,13 @@ def send_volume_alert(sym, px, header, extra=""):
             faded = True
         else:
             _vol_alert_px[sym] = (day, px)
+        if faded:
+            # DTSS said "volume coming in" four times inside ten minutes. Once
+            # is the information; the repeats are noise, so rate-limit this
+            # variant per ticker.
+            if now_ts - _vol_faded_ts.get(sym, 0.0) < VOL_FADED_COOLDOWN:
+                return
+            _vol_faded_ts[sym] = now_ts
     if faded:
         send_telegram("\U0001F50A <b>VOLUME COMING IN</b>\n"
                       + "<b>" + html.escape(sym) + "</b>")
@@ -2467,6 +2478,7 @@ def main():
             _halt_muted.clear()
             with _vol_alert_lock:
                 _vol_alert_px.clear()
+                _vol_faded_ts.clear()
             cur_day = today
             last_saved_n = 0
             log.info("New trading day %s: cleared de-dup memory", today)
