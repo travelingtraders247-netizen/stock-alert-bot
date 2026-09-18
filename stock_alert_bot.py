@@ -269,6 +269,7 @@ CATALYST_MIN_RVOL     = 2.0        # AND this much of a normal day's volume
 CATALYST_PENDING_SEC  = 21600      # hold an unconfirmed catalyst 6h, then drop
 CATALYST_MAX_PENDING  = 400
 CATALYST_RVOL_LOOKUPS = 12         # baseline fetches per confirmation pass
+CATALYST_DUP_SIM      = 0.60       # word overlap that counts as the same story
 INTERVAL_CATALYST     = 120
 
 # --- Repeat-halt throttle ----------------------------------------------------
@@ -1755,12 +1756,15 @@ def _news_alert(sym, headline, source, url, tag="NEWS"):
         return False
     if not is_english(headline):    # English-only channel
         return False
+    now_ts = time.time()
     with _cat_lock:
+        if _duplicate_story(sym, headline, now_ts):
+            return False            # same story, different wire
         if sym in _cat_pending:     # first headline per ticker wins
             return False
         if len(_cat_pending) >= CATALYST_MAX_PENDING:
             return False
-        _cat_pending[sym] = (time.time(), headline, tag)
+        _cat_pending[sym] = (now_ts, headline, tag)
     return True
 
 
@@ -1937,7 +1941,45 @@ _cik_map = {}            # {"day": yyyymmdd, "map": {cik_int: ticker}}
 
 # Every unconfirmed catalyst, whatever its source, waits here.
 _cat_pending = {}        # sym -> (first_seen_ts, headline, tag)
+_news_titles = defaultdict(list)   # sym -> [(ts, frozenset(words)), ...]
 _cat_lock = threading.Lock()
+
+_TITLE_STOP = frozenset(
+    "a an the and or of for to in on at by with from its it is are was were as "
+    "that this new inc corp ltd plc co company announces announce announced "
+    "reports report reported".split())
+
+
+def _title_tokens(text):
+    words = re.findall(r"[a-z0-9]+", (text or "").lower())
+    return frozenset(w for w in words if len(w) > 2 and w not in _TITLE_STOP)
+
+
+def _duplicate_story(sym, headline, now_ts):
+    """True if this ticker already had this same story in the last 24h.
+
+    One press release reaches us from Finnhub, GlobeNewswire, PRNewswire and
+    EDGAR under four different ids, so id-level de-dup cannot see that they are
+    the same event -- AMCI went out twice for a single story. Compare the words
+    instead: syndicated copies of one story score 0.75-1.00 against each other,
+    while genuinely different stories about the same ticker score about 0.20.
+    Callers must already hold _cat_lock.
+    """
+    toks = _title_tokens(headline)
+    if not toks:
+        return False
+    keep, dup = [], False
+    for ts, prev in _news_titles.get(sym, []):
+        if now_ts - ts >= NEWS_WINDOW_SEC:
+            continue                    # older than the throttle window
+        keep.append((ts, prev))
+        union = len(toks | prev)
+        if union and (len(toks & prev) / union) >= CATALYST_DUP_SIM:
+            dup = True
+    if not dup:
+        keep.append((now_ts, toks))
+    _news_titles[sym] = keep
+    return dup
 
 # Repeat-halt state.
 _halt_hist = {}          # sym -> {"ts": [...], "px0": float, "vol0": float}
