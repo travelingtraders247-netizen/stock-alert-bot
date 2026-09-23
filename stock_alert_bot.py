@@ -173,6 +173,7 @@ INTERVAL_UNIVERSE = 600
 INTERVAL_HALTS    = 20
 INTERVAL_NEWS     = 120
 INTERVAL_MOVER_NEWS = 300
+MOVER_NEWS_MAX      = 40   # flagged names given a direct news fetch per pass
 INTERVAL_NEWLIST  = 120
 INTERVAL_VOLROLL  = VOL_BUCKET_SEC
 
@@ -182,6 +183,8 @@ NASDAQ_SCREENER = ("https://api.nasdaq.com/api/screener/stocks"
 NASDAQ_EXTENDED = ("https://api.nasdaq.com/api/quote/{sym}/extended-trading"
                    "?assetclass=stocks&markettype={mt}&time=1")
 NASDAQ_IPO      = "https://api.nasdaq.com/api/ipo/calendar?date={ym}"
+NASDAQ_SYM_NEWS = ("https://api.nasdaq.com/api/news/topic/articlebysymbol"
+                   "?q={sym}%7Cstocks&offset=0&limit=8")
 NASDAQ_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -346,6 +349,7 @@ DRY_RUN = "--test" in sys.argv
 NEWLINE = "\n"
 
 _log_q = queue.Queue(maxsize=5000)
+_log_drops = [0]         # records thrown away because the listener stopped draining
 
 
 class _DropWhenFull(logging.handlers.QueueHandler):
@@ -367,7 +371,7 @@ class _DropWhenFull(logging.handlers.QueueHandler):
         try:
             self.queue.put_nowait(record)
         except queue.Full:
-            pass
+            _log_drops[0] += 1      # listener is wedged; watchdog watches this
 
 
 _log_stream = logging.StreamHandler(sys.stdout)
@@ -1568,8 +1572,25 @@ def _watchdog():
     first and blocked on that very write for 29 hours on 2026-08-30 -- the one
     thread whose job was to rescue us was the one thing the wedge could stop.
     """
+    log_full_since = [0.0]
     while True:
         time.sleep(30)
+        # A wedged log listener does not stall the main loop, so the tick check
+        # below can never see it. Watch the drop counter instead: if records are
+        # still being binned five minutes on, we are running blind -- restart.
+        if _log_q.full() and _log_drops[0] > 0:
+            if not log_full_since[0]:
+                log_full_since[0] = time.time()
+            elif time.time() - log_full_since[0] > 300:
+                threading.Thread(target=lambda: (time.sleep(5), os._exit(1)),
+                                 daemon=True).start()
+                try:
+                    os.write(2, b"WATCHDOG: logging wedged -- exiting for restart\n")
+                except OSError:
+                    pass
+                os._exit(1)
+        else:
+            log_full_since[0] = 0.0
         if time.time() - _last_tick[0] <= WATCHDOG_TIMEOUT:
             continue
         # Guarantee the exit even if the raw write below blocks too.
@@ -2182,6 +2203,34 @@ def check_new_listings():
         log.info("New-listing scan: polled %d candidates", checked)
 
 
+def nasdaq_symbol_news(sym):
+    """Today's headlines for ONE symbol from Nasdaq's own aggregator.
+
+    Free, no key, and independent of both Finnhub and the PR wires, so it
+    covers releases that never travel through any of them.
+    """
+    url = NASDAQ_SYM_NEWS.format(sym=sym)
+    out = []
+    try:
+        r = _http.get(url, headers=NASDAQ_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return out
+        rows = ((r.json().get("data") or {}).get("rows")) or []
+    except (requests.RequestException, ValueError, AttributeError):
+        return out
+    today = now_et().strftime("%b %d, %Y")
+    for row in rows[:6]:
+        title = str(row.get("title") or "").strip()
+        if not title:
+            continue
+        created = str(row.get("created") or "")
+        if created and created != today:
+            continue                # only today's news counts as a catalyst
+        out.append((created, str(row.get("publisher") or "Nasdaq"),
+                    title, str(row.get("url") or "")))
+    return out
+
+
 def check_mover_news():
     """Pull catalysts for stocks the scanner has ALREADY flagged as moving.
 
@@ -2191,13 +2240,27 @@ def check_mover_news():
     directly from Finnhub instead -- if a stock is up 30%+ there is almost
     always a release behind it, and this surfaces it.
     """
+    # _watchlist is regular-session movers only. _catalyst also holds premarket
+    # runners, halted names and board entrants -- exactly the ones that were
+    # being skipped. LHSW ran +135%, topped the premarket board and halted, and
+    # its release was never fetched because it never reached _watchlist.
     with _watch_lock:
-        syms = sorted(_watchlist)[:25]
+        flagged = set(_watchlist)
+    flagged |= set(_catalyst)
+    syms = sorted(flagged)[:MOVER_NEWS_MAX]
     if not syms:
         return
     today = now_et().strftime("%Y-%m-%d")
     found = 0
     for sym in syms:
+        # Second opinion, and it goes first: Finnhub's free tier does not carry
+        # some micro-caps, and the wires miss anything distributed outside them,
+        # so ask Nasdaq's own per-symbol aggregator as well.
+        for created, publisher, title, link in nasdaq_symbol_news(sym):
+            nid = "nnews:" + sym + ":" + (link or title)[:120]
+            if once(nid) and _news_alert(sym, title, publisher, link,
+                                         tag="CATALYST"):
+                found += 1
         items = finnhub_get("company-news",
                             {"symbol": sym, "from": today, "to": today})
         if not isinstance(items, list):
@@ -2525,9 +2588,23 @@ def main():
             last_saved_n = 0
             log.info("New trading day %s: cleared de-dup memory", today)
         # Heartbeat -- if these stop, the loop is wedged.
+        #
+        # Written STRAIGHT to fd 1, deliberately bypassing the logging system.
+        # On 2026-09-18 the bot kept alerting for 8 hours while every log line
+        # vanished: the queue listener wedged, the queue filled, and the drop
+        # policy silently binned everything. Liveness has to be provable even
+        # when logging is dead, or the silence monitor cannot tell a frozen bot
+        # from a working one and redeploys healthy processes.
         if time.time() - last_beat >= HEARTBEAT_SEC:
-            log.info("heartbeat: session=%s seen=%d watchlist=%d catalysts=%d",
-                     session(), len(_seen), len(_watchlist), len(_catalyst))
+            beat = ("%s heartbeat: session=%s seen=%d watchlist=%d "
+                    "catalysts=%d drops=%d\n" % (
+                        now_et().strftime("%Y-%m-%d %H:%M:%S"), session(),
+                        len(_seen), len(_watchlist), len(_catalyst),
+                        _log_drops[0]))
+            try:
+                os.write(1, beat.encode("utf-8", "replace"))
+            except OSError:
+                pass
             last_beat = time.time()
 
         now = time.time()
