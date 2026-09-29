@@ -57,6 +57,7 @@ import time
 import html
 import queue
 import logging
+import faulthandler
 import logging.handlers
 import threading
 from collections import defaultdict, deque
@@ -350,6 +351,31 @@ NEWLINE = "\n"
 
 _log_q = queue.Queue(maxsize=5000)
 _log_drops = [0]         # records thrown away because the listener stopped draining
+
+# --- Freeze diagnostics ------------------------------------------------------
+# The watchdog has now failed to fire on three separate freezes. Rather than
+# guess a fourth time, get evidence. faulthandler is implemented in C and dumps
+# EVERY thread's stack without needing the GIL, so it still works when Python
+# threads are starved -- which is one of the things we need to rule in or out.
+# The timer is re-armed on each main-loop tick, so a dump only ever appears if
+# the loop actually stalls.
+FAULT_DUMP_AFTER = 180
+
+
+def _pulse():
+    """Independent proof-of-life. No locks, no logging, no shared state.
+
+    If pulses keep printing while the main loop is silent, the process is alive
+    and only the loop is wedged. If pulses stop too, the whole process is being
+    frozen -- which no in-process watchdog could ever survive, and the external
+    monitor is the only possible rescue. That distinction decides the fix.
+    """
+    while True:
+        time.sleep(30)
+        try:
+            os.write(1, b"pulse\n")
+        except OSError:
+            pass
 
 
 class _DropWhenFull(logging.handlers.QueueHandler):
@@ -2567,9 +2593,18 @@ def main():
     last_beat = time.time()
 
     threading.Thread(target=_watchdog, daemon=True).start()
+    threading.Thread(target=_pulse, daemon=True).start()
+    faulthandler.enable()
 
     while True:
         _last_tick[0] = time.time()     # watchdog liveness
+        # Re-arm the stack-dump timer. If the loop does not come back round
+        # within FAULT_DUMP_AFTER seconds, every thread's traceback lands on
+        # stderr and we finally see what is holding it.
+        try:
+            faulthandler.dump_traceback_later(FAULT_DUMP_AFTER, exit=False)
+        except Exception:  # noqa: BLE001 - diagnostics must never break the loop
+            pass
         # New trading day: drop yesterday's de-dup keys. Without this the set
         # grows for the life of the process (it was only ever reset on restart).
         today = now_et().strftime("%Y%m%d")
