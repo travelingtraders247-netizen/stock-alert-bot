@@ -186,6 +186,14 @@ NASDAQ_EXTENDED = ("https://api.nasdaq.com/api/quote/{sym}/extended-trading"
 NASDAQ_IPO      = "https://api.nasdaq.com/api/ipo/calendar?date={ym}"
 NASDAQ_SYM_NEWS = ("https://api.nasdaq.com/api/news/topic/articlebysymbol"
                    "?q={sym}%7Cstocks&offset=0&limit=8")
+
+# Alpaca's news feed carries Benzinga's wire, per-symbol, on a free self-serve
+# key -- the one source that had the LHSW release when Finnhub, the PR wires and
+# Nasdaq's aggregator all missed it. Inert until both variables are set, so the
+# bot runs unchanged without them.
+ALPACA_NEWS_URL = ("https://data.alpaca.markets/v1beta1/news"
+                   "?symbols={sym}&limit=10&sort=desc")
+ALPACA_NEWS_MAX_AGE = 43200        # only stories from the last 12 hours
 NASDAQ_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -197,6 +205,8 @@ NASDAQ_HEADERS = {
 NASDAQ_QUOTE    = "https://api.nasdaq.com/api/quote/{sym}/info?assetclass=stocks"
 NASDAQ_HIST     = ("https://api.nasdaq.com/api/quote/{sym}/historical"
                    "?assetclass=stocks&fromdate={frm}&todate={to}&limit=15")
+ALPACA_KEY    = _env("ALPACA_API_KEY")
+ALPACA_SECRET = _env("ALPACA_SECRET_KEY")
 FINNHUB_BASE = "https://finnhub.io/api/v1"
 FINNHUB_WS   = "wss://ws.finnhub.io?token="
 
@@ -2229,6 +2239,47 @@ def check_new_listings():
         log.info("New-listing scan: polled %d candidates", checked)
 
 
+def alpaca_symbol_news(sym):
+    """Recent headlines for ONE symbol from Alpaca (Benzinga-sourced).
+
+    Returns [] when no keys are configured, so this is a no-op until
+    ALPACA_API_KEY and ALPACA_SECRET_KEY exist in the environment.
+    """
+    if not (ALPACA_KEY and ALPACA_SECRET):
+        return []
+    out = []
+    try:
+        r = _http.get(ALPACA_NEWS_URL.format(sym=sym),
+                      headers={"APCA-API-KEY-ID": ALPACA_KEY,
+                               "APCA-API-SECRET-KEY": ALPACA_SECRET,
+                               "Accept": "application/json"},
+                      timeout=12)
+        if r.status_code != 200:
+            if r.status_code in (401, 403):
+                log.warning("Alpaca news auth rejected (HTTP %s) -- check the "
+                            "two Railway variables", r.status_code)
+            return out
+        items = (r.json() or {}).get("news") or []
+    except (requests.RequestException, ValueError, AttributeError) as e:
+        log.warning("Alpaca news failed for %s: %s", sym, e)
+        return out
+    cutoff = time.time() - ALPACA_NEWS_MAX_AGE
+    for n in items:
+        headline = str(n.get("headline") or "").strip()
+        if not headline:
+            continue
+        created = str(n.get("created_at") or "")
+        try:
+            ts = datetime.strptime(created[:19], "%Y-%m-%dT%H:%M:%S").timestamp()
+        except (ValueError, TypeError):
+            ts = time.time()
+        if ts < cutoff:
+            continue                # stale; a catalyst has to be from today
+        out.append((created, str(n.get("source") or "Alpaca"), headline,
+                    str(n.get("url") or ""), str(n.get("id") or "")))
+    return out
+
+
 def nasdaq_symbol_news(sym):
     """Today's headlines for ONE symbol from Nasdaq's own aggregator.
 
@@ -2279,9 +2330,15 @@ def check_mover_news():
     today = now_et().strftime("%Y-%m-%d")
     found = 0
     for sym in syms:
-        # Second opinion, and it goes first: Finnhub's free tier does not carry
-        # some micro-caps, and the wires miss anything distributed outside them,
-        # so ask Nasdaq's own per-symbol aggregator as well.
+        # Alpaca first when configured -- it carries Benzinga's wire and was the
+        # only source that had the LHSW release.
+        for created, src, title, link, aid in alpaca_symbol_news(sym):
+            if once("anews:" + sym + ":" + (aid or link or title)[:120]) and \
+                    _news_alert(sym, title, src, link, tag="CATALYST"):
+                found += 1
+        # Second opinion: Finnhub's free tier does not carry some micro-caps,
+        # and the wires miss anything distributed outside them, so ask Nasdaq's
+        # own per-symbol aggregator as well.
         for created, publisher, title, link in nasdaq_symbol_news(sym):
             nid = "nnews:" + sym + ":" + (link or title)[:120]
             if once(nid) and _news_alert(sym, title, publisher, link,
