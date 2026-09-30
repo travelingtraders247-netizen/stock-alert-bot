@@ -1807,11 +1807,66 @@ def tickers_in(text):
         return {t for t in _TICKER_RE.findall(text.upper()) if t in uni}
 
 
+# --- Market round-up filter --------------------------------------------------
+# Benzinga and friends publish a constant stream of "12 Information Technology
+# Stocks Moving In Tuesday's Pre-Market Session" and "Stocks Rebound as Crude
+# Prices Fall". They tag EVERY ticker mentioned, so these arrive looking exactly
+# like a company catalyst while saying nothing whatsoever about the company.
+_ROUNDUP_RE = re.compile(
+    r"stocks?\s+moving"
+    r"|moving\s+in\s+\w+.{0,3}s?\s+(?:pre-?market|intraday|after-?market|mid-?day)"
+    r"|top\s+gainers?|gainers?\s+and\s+losers?|top\s+losers?|biggest\s+movers?"
+    r"|gapping\s+stocks?|stocks?\s+with\s+unusual\s+volume|unusual\s+options"
+    r"|most\s+active\s+stocks?|movers?\s+(?:list|report)"
+    r"|let.{0,2}s\s+(?:take|have)\s+a\s+look"
+    r"|traders?\s+are\s+paying\s+attention"
+    r"|market\s+(?:wrap|recap|summary|update)|midday\s+(?:movers|update)"
+    r"|\d+\s+(?:\w+\s+){0,3}stocks?\b"
+    r"|stocks?\s+(?:rebound|rally|slip|fall|climb|drop|edge|open|close)"
+    r"|dow\s+(?:gains?|falls?|jumps?|drops?|rises?)"
+    r"|s&p\s+500|nasdaq\s+composite"
+    r"|what.{0,3}s\s+moving|why\s+these\s+\d+",
+    re.I)
+_HEAD_TICKER_RE = re.compile(r"\b[A-Z]{2,5}\b")
+
+
+def is_generic_headline(sym, headline):
+    """True when a headline is a market round-up rather than news about SYM.
+
+    Three independent tests, any of which rejects:
+      1. It matches a known round-up phrase.
+      2. It names two or more OTHER real tickers -- a listicle is about none of
+         them in particular.
+      3. It mentions neither the company's name nor its ticker, which is what
+         broad market commentary looks like.
+    """
+    if not headline:
+        return True
+    if _ROUNDUP_RE.search(headline):
+        return True
+    with _universe_lock:
+        uni = dict(_universe)
+    name = (uni.get(sym) or {}).get("name") or ""
+    others = {t for t in _HEAD_TICKER_RE.findall(headline)
+              if t != sym and t in uni}
+    if len(others) >= 2:
+        return True
+    text = headline.lower()
+    if sym.lower() in text:
+        return False
+    for tok in re.findall(r"[a-z0-9]+", name.lower()):
+        if len(tok) >= 5 and tok not in _NAME_STOP and tok in text:
+            return False
+    return True
+
+
 def _news_alert(sym, headline, source, url, tag="NEWS"):
     """Queue a catalyst. Nothing is sent here -- see confirm_catalysts()."""
     if too_big(sym):                # fleet-wide market-cap gate
         return False
     if not is_english(headline):    # English-only channel
+        return False
+    if is_generic_headline(sym, headline):   # market round-up, not a catalyst
         return False
     now_ts = time.time()
     with _cat_lock:
