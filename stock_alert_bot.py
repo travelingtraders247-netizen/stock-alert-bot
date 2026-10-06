@@ -631,6 +631,18 @@ def session():
 # ----------------------------------------------------------------------
 # TELEGRAM
 # ----------------------------------------------------------------------
+def telegram_targets():
+    """Every channel an alert goes to.
+
+    TELEGRAM_CHAT_ID accepts a comma-separated list, so mirroring to a second
+    channel is a config change rather than a forwarding bot. Posting directly to
+    both is also more robust than forwarding: there is no third-party service in
+    the path that can rate-limit, lag or silently stop.
+    """
+    raw = (TELEGRAM_CHAT_ID or "").replace(";", ",")
+    return [c.strip() for c in raw.split(",") if c.strip()]
+
+
 def send_telegram(text):
     """Send an HTML message to Telegram, paced so we never trip the flood limit."""
     if _silent:
@@ -639,12 +651,18 @@ def send_telegram(text):
     if DRY_RUN:
         print("\n--- ALERT (dry run) ---\n" + text + "\n-----------------------")
         return
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    chats = telegram_targets()
+    if not TELEGRAM_BOT_TOKEN or not chats:
         log.warning("Telegram not configured; skipping send.")
         return
+    for chat in chats:
+        _send_one(text, chat)
+
+
+def _send_one(text, chat_id):
     url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": chat_id,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -1851,13 +1869,28 @@ def is_generic_headline(sym, headline):
               if t != sym and t in uni}
     if len(others) >= 2:
         return True
+    return not _is_subject(sym, headline, name)
+
+
+def _is_subject(sym, headline, name):
+    """Is SYM plausibly the SUBJECT of this headline, or just a word inside it?
+
+    CNTB (Connect Biopharma) was alerted on "...Industry-First Way to Connect
+    Workplace Savers and Financial Advisors" -- a story about Ascensus. The word
+    "connect" happens to be the company's distinctive name token, so a bare
+    substring test calls that a match. A single common word only counts when the
+    headline actually leads with it, the way a press release does.
+    """
     text = headline.lower()
-    if sym.lower() in text:
-        return False
-    for tok in re.findall(r"[a-z0-9]+", name.lower()):
-        if len(tok) >= 5 and tok not in _NAME_STOP and tok in text:
-            return False
-    return True
+    words = re.findall(r"[a-z0-9]+", text)
+    if re.search(r"\b" + re.escape(sym.lower()) + r"\b", text):
+        return True                 # the ticker itself, as a whole word
+    toks = [t for t in re.findall(r"[a-z0-9]+", name.lower())
+            if len(t) >= 5 and t not in _NAME_STOP]
+    hits = [t for t in toks if t in words]
+    if len(hits) >= 2:
+        return True                 # two name words is not a coincidence
+    return bool(hits) and hits[0] in words[:4]
 
 
 def _news_alert(sym, headline, source, url, tag="NEWS"):
