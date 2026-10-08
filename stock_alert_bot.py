@@ -2641,14 +2641,9 @@ def check_halts():
                      "no volume expansion since the first alert", sym)
             continue
         price_str = ("  $" + format(px, ",.2f")) if px else ""
-        code = (entry.get("ndaq_reasoncode") or "").strip().upper()
-        reason = ""
-        if code:
-            desc = HALT_REASONS.get(code)
-            reason = "\n" + html.escape(code + (" - " + desc if desc else ""))
         send_telegram(
             "\U0001F6A8 <b>TRADING HALT</b>\n"
-            + "<b>" + html.escape(sym) + "</b>" + price_str + reason
+            + "<b>" + html.escape(sym) + "</b>" + price_str
         )
 
 
