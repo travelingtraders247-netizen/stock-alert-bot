@@ -292,6 +292,7 @@ INTERVAL_CATALYST     = 120
 # the stock has to prove it is actually going somewhere: BOTH a bullish move and
 # materially more volume than at the first alert of that window. A stock just
 # chopping in and out of halts goes quiet.
+HALT_MIN_MOVE        = 10.0        # |percent| move that makes a halt worth sending
 HALT_MAX_PER_24H     = 2
 HALT_WINDOW_SEC      = 86400
 HALT_REPEAT_MIN_PCT  = 7.0         # above the price at the first alert
@@ -2480,6 +2481,62 @@ def _session_volume(sym):
         return (_universe.get(sym) or {}).get("vol")
 
 
+_live_pct_cache = {}     # sym -> (ts, pct) from the per-symbol quote
+
+
+def live_pct(sym):
+    """Today's percent move for ONE symbol, straight from the live quote.
+
+    Deliberately not the screener: its per-symbol rows go stale for exactly the
+    names worth watching. SDEV showed $1.57 / +5.37% there while the live quote
+    read $2.88 / +83.44%. Cached 60s -- halts are rare, so this costs little.
+    """
+    hit = _live_pct_cache.get(sym)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    pct = None
+    try:
+        r = _http.get(NASDAQ_QUOTE.format(sym=sym), headers=NASDAQ_HEADERS,
+                      timeout=10)
+        if r.status_code == 200:
+            prim = ((r.json().get("data") or {}).get("primaryData")) or {}
+            pct = _num(prim.get("percentageChange"))
+    except (requests.RequestException, ValueError, AttributeError):
+        pass
+    _live_pct_cache[sym] = (time.time(), pct)
+    return pct
+
+
+def halt_is_interesting(sym):
+    """(ok, pct) -- is this halt attached to a stock that is actually moving?
+
+    Most halts are housekeeping on names that have gone nowhere. A halt only
+    earns an alert if the stock either made a top-gainers board today or has
+    moved at least HALT_MIN_MOVE percent in either direction -- a hard drop is
+    as informative as a hard rally when trading stops.
+    """
+    with _board_lock:
+        on_board = any(sym in syms for syms in _board_seen.values())
+    if on_board:
+        return True, None
+    pct = live_pct(sym)
+    if pct is None:                 # quote unavailable: fall back to the snapshot
+        sess = session()
+        if sess in ("pre", "post"):
+            with _cat_lock:
+                q = (_wb_cache["quotes"].get(sym) or {}) if \
+                    time.time() - _wb_cache["ts"] < 600 else {}
+            if q.get("pct") is not None:
+                pct = q["pct"] * 100.0
+        if pct is None:
+            with _universe_lock:
+                pct = (_universe.get(sym) or {}).get("pct")
+    if pct is None:
+        # Nothing to judge on. Send it rather than silently swallow a halt.
+        return True, None
+    return abs(pct) >= HALT_MIN_MOVE, pct
+
+
 def halt_allowed(sym, px):
     """Should this halt alert, given how often the name has already halted?
 
@@ -2571,6 +2628,12 @@ def check_halts():
         if too_big(sym):              # fleet-wide market-cap gate
             continue
         _catalyst.add(sym)            # halted names are prime premarket candidates
+        worth, hpct = halt_is_interesting(sym)
+        if not worth:
+            _halt_muted.add(sym + ":" + stamp)
+            log.info("Halt %s suppressed: only %s%% move and not on a board",
+                     sym, format(hpct, "+.1f") if hpct is not None else "?")
+            continue
         px = current_price(sym)
         if not halt_allowed(sym, px):
             _halt_muted.add(sym + ":" + stamp)
