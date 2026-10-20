@@ -56,12 +56,13 @@ import json
 import time
 import html
 import queue
+import socket
 import logging
 import faulthandler
 import logging.handlers
 import threading
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 from datetime import datetime, timedelta
 
 try:
@@ -156,6 +157,12 @@ EXT_RVOL_MIN        = 2.0          # extended volume vs a normal FULL day
 EXT_RVOL_MIN_SHARES = 400_000      # absolute floor before we bother looking up
 EXT_RVOL_LOOKUPS    = 12           # baseline fetches per sweep
 EXT_TIMEOUT         = 8            # per-symbol extended fetch timeout
+EXT_SWEEP_BUDGET    = 420          # hard ceiling on one sweep; stragglers abandoned
+# requests' timeout is per-socket-operation, so a server that dribbles bytes can
+# hold a read open forever -- every byte resets the clock. On 2026-10-20 six
+# sweep workers sat in ssl.read inside fetch_extended and the bot went quiet for
+# 7 hours. This is the backstop a per-call timeout cannot provide.
+socket.setdefaulttimeout(25)
 EXT_PRIORITY_PCT    = 10.0         # |today move| that earns a front-of-queue probe
 EXT_PRIORITY_VOL    = 300_000      # ...paired with real turnover
 EXT_TAIL_CHUNK      = 700          # long-tail symbols per sweep (rotates)
@@ -1289,8 +1296,24 @@ def scan_extended():
         return sym, fetch_extended(sym, markettype)
 
     errors = 0
-    with ThreadPoolExecutor(max_workers=EXT_WORKERS) as pool:
-        for sym, q in pool.map(probe, cands):
+    # Never block on a straggler. pool.map inside a `with` waits for every worker
+    # on exit, so a single hung socket wedges the sweep -- and the thread it runs
+    # on -- indefinitely. Submit, wait with a budget, abandon the rest.
+    pool = ThreadPoolExecutor(max_workers=EXT_WORKERS)
+    futs = [pool.submit(probe, s) for s in cands]
+    done, pending = futures_wait(futs, timeout=EXT_SWEEP_BUDGET)
+    if pending:
+        log.warning("%s sweep: abandoned %d symbol(s) still in flight",
+                    label, len(pending))
+    pool.shutdown(wait=False, cancel_futures=True)
+    results = []
+    for f in done:
+        try:
+            results.append(f.result(timeout=0))
+        except Exception:  # noqa: BLE001 - a dead probe is just a miss
+            errors += 1
+    if True:
+        for sym, q in results:
             if q == "ERR":
                 errors += 1
                 continue
