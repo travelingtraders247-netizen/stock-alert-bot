@@ -2442,6 +2442,7 @@ def check_mover_news():
         return
     today = now_et().strftime("%Y-%m-%d")
     found = 0
+    by_src = {"alpaca": 0, "finnhub": 0, "nasdaq": 0}
     for sym in syms:
         # Alpaca first when configured -- it carries Benzinga's wire and was the
         # only source that had the LHSW release.
@@ -2449,6 +2450,7 @@ def check_mover_news():
             if once("anews:" + sym + ":" + (aid or link or title)[:120]) and \
                     _news_alert(sym, title, src, link, tag="CATALYST"):
                 found += 1
+                by_src["alpaca"] += 1
         # Second opinion: Finnhub's free tier does not carry some micro-caps,
         # and the wires miss anything distributed outside them, so ask Nasdaq's
         # own per-symbol aggregator as well.
@@ -2457,6 +2459,7 @@ def check_mover_news():
             if once(nid) and _news_alert(sym, title, publisher, link,
                                          tag="CATALYST"):
                 found += 1
+                by_src["nasdaq"] += 1
         items = finnhub_get("company-news",
                             {"symbol": sym, "from": today, "to": today})
         if not isinstance(items, list):
@@ -2470,9 +2473,12 @@ def check_mover_news():
             if _news_alert(sym, headline, str(n.get("source") or ""), url,
                            tag="CATALYST"):
                 found += 1
+                by_src["finnhub"] += 1
         time.sleep(0.3)             # stay under Finnhub 60 calls/min
     if found:
-        log.info("Mover-news: %d catalyst alerts across %d movers", found, len(syms))
+        log.info("Mover-news: %d queued across %d flagged names "
+                 "(alpaca=%d finnhub=%d nasdaq=%d)", found, len(syms),
+                 by_src["alpaca"], by_src["finnhub"], by_src["nasdaq"])
 
 
 # ----------------------------------------------------------------------
@@ -2765,6 +2771,12 @@ def check_volume_surge():
 # MAIN LOOP
 # ----------------------------------------------------------------------
 def main():
+    srcs = ["Alpaca/Benzinga" if (ALPACA_KEY and ALPACA_SECRET)
+            else "Alpaca/Benzinga OFF (no keys)",
+            "Finnhub" if FINNHUB_API_KEY else "Finnhub OFF (no key)",
+            "Nasdaq per-symbol", "EDGAR",
+            format(len(PR_FEEDS), "d") + " PR wires"]
+    log.info("Catalyst sources: %s", " | ".join(srcs))
     log.info("Starting small-cap alert bot (dry_run=%s). Session=%s. "
              "Regular: $%.2f-$%.2f >=%.0f%% | Extended: >=%.0f%% vol>=%s",
              DRY_RUN, session(), PRICE_MIN, PRICE_MAX, MIN_PERCENT,
