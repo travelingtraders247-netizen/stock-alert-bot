@@ -181,7 +181,7 @@ INTERVAL_UNIVERSE = 600
 INTERVAL_HALTS    = 20
 INTERVAL_NEWS     = 120
 INTERVAL_MOVER_NEWS = 300
-MOVER_NEWS_MAX      = 40   # flagged names given a direct news fetch per pass
+MOVER_NEWS_MAX      = 60   # flagged names given a direct news fetch per pass
 INTERVAL_NEWLIST  = 120
 INTERVAL_VOLROLL  = VOL_BUCKET_SEC
 
@@ -2437,7 +2437,32 @@ def check_mover_news():
     with _watch_lock:
         flagged = set(_watchlist)
     flagged |= set(_catalyst)
-    syms = sorted(flagged)[:MOVER_NEWS_MAX]
+    # Order by how hard the name is actually moving, NOT alphabetically. With
+    # 191 flagged symbols and a cap of 60, sorted() meant everything past the
+    # letter C was never polled: VBIO ran +27.7% premarket on an acquisition
+    # headline and its news was never once fetched.
+    with _universe_lock:
+        uni = dict(_universe)
+    now_ts = time.time()
+    with _cat_lock:
+        wb = dict(_wb_cache["quotes"]) if now_ts - _wb_cache["ts"] < 600 else {}
+    with _board_lock:
+        boarded = set()
+        for syms_on in _board_seen.values():
+            boarded |= syms_on
+        ext = {k: v[2] for k, v in _ext_board.items() if now_ts - v[0] < 1800}
+
+    def _move(sym):
+        pct = abs((uni.get(sym) or {}).get("pct") or 0.0)
+        q = wb.get(sym) or {}
+        if q.get("pct") is not None:
+            pct = max(pct, abs(q["pct"] * 100.0))
+        if sym in ext:
+            pct = max(pct, abs(ext[sym] or 0.0))
+        # Anything that made a board today is already proven to be moving.
+        return (1 if sym in boarded else 0, pct)
+
+    syms = sorted(flagged, key=_move, reverse=True)[:MOVER_NEWS_MAX]
     if not syms:
         return
     today = now_et().strftime("%Y-%m-%d")
