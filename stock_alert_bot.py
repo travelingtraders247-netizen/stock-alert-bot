@@ -943,6 +943,35 @@ def refresh_universe():
             "vol": _num(row.get("volume")) or 0.0,
             "pct": _num(str(row.get("pctchange") or "").replace("%", "")) or 0.0,
         }
+    # The Nasdaq screener is not complete. AZTR ran +72% on 44x average volume
+    # and was absent from all 6,938 rows, which made it invisible to EVERY alert
+    # type at once -- runners, board, news matching and catalysts all read this
+    # universe. Webull's market-wide ranking covers Nasdaq, NYSE and AMEX and is
+    # live, so it backfills whatever the screener dropped.
+    added = 0
+    for r in webull_movers("1d"):
+        sym = r.get("symbol")
+        price = r.get("price")
+        mcap = r.get("mcap")
+        if not sym or sym in uni or price is None:
+            continue
+        if price < PRICE_MIN or price > PRICE_MAX:
+            continue
+        if mcap is not None and mcap > MAX_MARKET_CAP:
+            continue
+        uni[sym] = {
+            "close": price,
+            "mcap": mcap,
+            "name": r.get("name") or "",
+            "vol": r.get("volume") or 0.0,
+            "pct": r.get("pct") or 0.0,
+        }
+        if mcap is not None:
+            caps[sym] = mcap
+        added += 1
+    if added:
+        log.info("Universe: +%d mover(s) the screener omitted", added)
+
     # Company-name -> ticker index, so a PR headline that says "Expion" or
     # "Reitar Logtech" (and never prints the symbol) can still be matched.
     nidx, npre = {}, {}
@@ -1407,6 +1436,8 @@ def webull_movers(rank_type):
             continue
         out.append({"symbol": sym, "price": price, "pct": ratio * 100.0,
                     "mcap": _num(t.get("marketValue")),
+                    "name": str(t.get("name") or "").strip(),
+                    "volume": _num(t.get("volume")) or 0.0,
                     "tickerId": t.get("tickerId")})
     return out
 
