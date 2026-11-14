@@ -2660,11 +2660,12 @@ def halt_allowed(sym, px):
 def check_halts():
     if feedparser is None:
         return
-    # Halts only mean something while a session is running. Outside 4:00-20:00 ET
-    # and all weekend we still READ the feed and record its ids -- otherwise the
-    # first poll of Monday's premarket would blast Friday's entire backlog -- but
-    # nothing is sent.
-    quiet = session() not in ("pre", "regular", "post")
+    # Halts are only sent during PREMARKET and REGULAR hours. After-hours halts
+    # are excluded by choice -- by then the session is thin and a pause says
+    # little that is tradeable. Outside those windows, and all weekend, we still
+    # READ the feed and record its ids -- otherwise the first poll of Monday's
+    # premarket would blast the whole backlog -- but nothing is sent.
+    quiet = session() not in ("pre", "regular")
     try:
         feed = feedparser.parse(NASDAQ_HALT_RSS)
     except Exception as e:  # noqa: BLE001
