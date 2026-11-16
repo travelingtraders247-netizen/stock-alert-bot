@@ -380,6 +380,36 @@ _log_drops = [0]         # records thrown away because the listener stopped drai
 # the loop actually stalls.
 FAULT_DUMP_AFTER = 180
 
+# --- External dead-man's switch ---------------------------------------------
+# On 2026-11-16 the entire process stopped executing for eight hours, straight
+# through premarket. The pulse thread, the watchdog and faulthandler all stopped
+# with it -- nothing running INSIDE this process can detect that, because the
+# detector stops too. So the signal has to go outward: we ping an external
+# service on a schedule, and it alerts when the pings stop.
+HEALTHCHECK_URL   = _env("HEALTHCHECK_URL")
+HEALTHCHECK_EVERY = 60     # seconds between pings
+HEALTHCHECK_STALE = 300    # stop pinging if the main loop has not ticked in this long
+
+
+def _deadman():
+    """Ping the switch, but ONLY while the main loop is actually ticking.
+
+    Gating on _last_tick matters: if the loop wedges while this thread survives,
+    an ungated ping would report a dead bot as healthy. This way both failure
+    modes -- whole process stopped, or main loop wedged -- trip the same alarm.
+    """
+    if not HEALTHCHECK_URL:
+        return
+    log.info("Dead-man switch armed: pinging every %ds", HEALTHCHECK_EVERY)
+    while True:
+        time.sleep(HEALTHCHECK_EVERY)
+        if time.time() - _last_tick[0] > HEALTHCHECK_STALE:
+            continue                    # loop is wedged: let the switch trip
+        try:
+            _http.get(HEALTHCHECK_URL, timeout=10)
+        except requests.RequestException:
+            pass                        # a missed ping is fine; a run of them is the signal
+
 
 def _pulse():
     """Independent proof-of-life. No locks, no logging, no shared state.
@@ -2893,6 +2923,7 @@ def main():
 
     threading.Thread(target=_watchdog, daemon=True).start()
     threading.Thread(target=_pulse, daemon=True).start()
+    threading.Thread(target=_deadman, daemon=True).start()
     faulthandler.enable()
 
     while True:
