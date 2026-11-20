@@ -155,7 +155,7 @@ EXT_WORKERS      = 10               # concurrent extended fetches (trial-plan sa
 MAX_EXT_ALERTS   = 20              # alerts per sweep (biggest movers first)
 EXT_RVOL_MIN        = 2.0          # extended volume vs a normal FULL day
 EXT_RVOL_MIN_SHARES = 400_000      # absolute floor before we bother looking up
-EXT_RVOL_LOOKUPS    = 12           # baseline fetches per sweep
+EXT_RVOL_LOOKUPS    = 12
 EXT_TIMEOUT         = 8            # per-symbol extended fetch timeout
 EXT_SWEEP_BUDGET    = 420          # hard ceiling on one sweep; stragglers abandoned
 # requests' timeout is per-socket-operation, so a server that dribbles bytes can
@@ -165,7 +165,7 @@ EXT_SWEEP_BUDGET    = 420          # hard ceiling on one sweep; stragglers aband
 socket.setdefaulttimeout(25)
 EXT_PRIORITY_PCT    = 10.0         # |today move| that earns a front-of-queue probe
 EXT_PRIORITY_VOL    = 300_000      # ...paired with real turnover
-EXT_TAIL_CHUNK      = 700          # long-tail symbols per sweep (rotates)
+EXT_TAIL_CHUNK      = 700          # long-tail symbols per sweep (rotates)           # baseline fetches per sweep
 
 # Volume-surge thresholds (WebSocket trades)
 VOL_BUCKET_SEC  = 60
@@ -190,6 +190,9 @@ NASDAQ_SCREENER = ("https://api.nasdaq.com/api/screener/stocks"
                    "?tableonly=true&limit=6000&offset=0&download=true")
 NASDAQ_EXTENDED = ("https://api.nasdaq.com/api/quote/{sym}/extended-trading"
                    "?assetclass=stocks&markettype={mt}&time=1")
+NASDAQ_QUOTE    = "https://api.nasdaq.com/api/quote/{sym}/info?assetclass=stocks"
+NASDAQ_HIST     = ("https://api.nasdaq.com/api/quote/{sym}/historical"
+                   "?assetclass=stocks&fromdate={frm}&todate={to}&limit=15")
 NASDAQ_IPO      = "https://api.nasdaq.com/api/ipo/calendar?date={ym}"
 NASDAQ_SYM_NEWS = ("https://api.nasdaq.com/api/news/topic/articlebysymbol"
                    "?q={sym}%7Cstocks&offset=0&limit=8")
@@ -209,9 +212,6 @@ NASDAQ_HEADERS = {
     "Origin": "https://www.nasdaq.com",
     "Referer": "https://www.nasdaq.com/",
 }
-NASDAQ_QUOTE    = "https://api.nasdaq.com/api/quote/{sym}/info?assetclass=stocks"
-NASDAQ_HIST     = ("https://api.nasdaq.com/api/quote/{sym}/historical"
-                   "?assetclass=stocks&fromdate={frm}&todate={to}&limit=15")
 ALPACA_KEY    = _env("ALPACA_API_KEY")
 ALPACA_SECRET = _env("ALPACA_SECRET_KEY")
 FINNHUB_BASE = "https://finnhub.io/api/v1"
@@ -226,8 +226,8 @@ PR_FEEDS = [
 # NOTE: each wire feed only exposes ~20 recent items and is mostly noise
 # (European regulatory filings, consumer PR), so a small-cap release can scroll
 # off before we see it. ACCESSWIRE's public feed is dead and Business Wire's
-# broad feeds are a paid media-partner product. check_mover_news() closes that
-# gap from the other direction.
+# broad feeds are a paid media-partner product. check_mover_news() below closes
+# that gap from the other direction.
 
 # Nasdaq / UTP halt reason codes -> plain English. Unmapped codes show as-is.
 # The distinction matters: LUDP/T5 usually resume quickly, T1 (news pending)
@@ -342,6 +342,36 @@ WEBULL_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+# Webull's quote PAGE server-renders a per-symbol news list into a
+# window.__initState__ blob: tickerMap[tickerId].newsData[]. It carries
+# TipRanks, Benzinga, Barchart and Seeking Alpha items that none of the API
+# feeds had. On 2026-11-19 the MEDS acquisition release ("DataMeds AI Agrees
+# To Acquire Certain Assets From Estate Of Todos Medical") was published by
+# BENZINGA, was visible here, and came back EMPTY from Alpaca's
+# Benzinga-sourced API for the same symbol and window -- so Alpaca's free tier
+# is a subset of Benzinga, not all of it. Used only as a FALLBACK for movers
+# the other sources came back empty on: each page is ~500KB, so fetching one
+# for every flagged name every pass would be wasteful.
+WEBULL_NEWS_PAGE         = "https://www.webull.com/quote/{slug}/news"
+WEBULL_NEWS_MAX_AGE      = 43200   # 12h, same window as Alpaca
+WEBULL_NEWS_FALLBACK_MAX = 12      # pages per pass, hardest movers first
+WEBULL_NEWS_PER_SYM_SEC  = 1800    # at most one page per symbol per 30 min
+# The slug needs the right exchange prefix: nasdaq-meds resolves, nyse-meds 404s.
+WEBULL_SLUG_PREFIX = {
+    "NASDAQ": "nasdaq", "NYSE": "nyse", "AMEX": "amex",
+    "NYSEAMERICAN": "amex", "NYSEMKT": "amex", "ARCA": "nyse",
+    "BATS": "nasdaq", "CBOE": "nasdaq",
+}
+WEBULL_SEARCH_URL = ("https://quotes-gw.webullfintech.com/api/search/pc/tickers"
+                     "?keyword={sym}&pageIndex=1&pageSize=5")
+# Webull auto-generates these; they are not catalysts.
+WEBULL_NEWS_SKIP_SRC = {"weekly report"}
+WEBULL_PAGE_HEADERS = dict(WEBULL_HEADERS)
+WEBULL_PAGE_HEADERS["Accept"] = "text/html,application/xhtml+xml,*/*"
+
+_wb_slug      = {}                 # sym -> slug, or None when unresolvable
+_wb_slug_lock = threading.Lock()
+
 # Never block the scheduler for more than this on a Telegram rate-limit, and emit
 # a heartbeat so a silent stall is obvious in the logs.
 MAX_TG_SLEEP     = 60
@@ -429,12 +459,6 @@ def _pulse():
 
 class _DropWhenFull(logging.handlers.QueueHandler):
     """Never block a worker thread just to emit a log line."""
-
-    def prepare(self, record):
-        # Same process, so no pickling is needed. The default prepare()
-        # pre-formats the record and the listener then formats it again,
-        # which double-prefixes every line.
-        return record
 
     def prepare(self, record):
         # Same process, so no pickling is needed. The default prepare()
@@ -1336,7 +1360,7 @@ def build_candidates():
 
 
 def scan_extended():
-    """Premarket / after-hours gap scanner across the WHOLE small-cap universe."""
+    """Premarket / after-hours gap scanner."""
     sess = session()
     if sess not in ("pre", "post"):
         return
@@ -1586,8 +1610,8 @@ def board_rows():
     Extended hours have no free market-wide feed -- Nasdaq's screener still
     reports the last REGULAR print before the open and after the close -- so
     those boards are built from what our own extended sweep has seen this
-    session. Movers are re-polled every sweep and the rest of the market
-    rotates through, so an extended board is best-effort, not exhaustive.
+    session. Movers are re-polled every sweep; the rest of the market rotates
+    through, so an extended board is best-effort, not exhaustive.
     """
     def eligible(r):
         return (BOARD_PRICE_MIN <= r["price"] <= BOARD_PRICE_MAX
@@ -1634,7 +1658,7 @@ def board_rows():
         log.info("Board (%s): Webull gave %d rows, none cleared the filters; "
                  "falling back to the sweep", sess, len(wb))
 
-    cutoff = time.time() - 1800     # drop anything not seen in 30 minutes
+    cutoff = time.time() - 1800     # drop anything we have not seen in 30 min
     rows = []
     with _board_lock:
         items = list(_ext_board.items())
@@ -1654,11 +1678,11 @@ def _board_line(i, r):
 
 
 def check_top_board():
-    """Post the session's top gainers, then only new entrants after that.
+    """Post the session's top-{N} gainers, then only new entrants after that.
 
-    The rule is do not re-post a name that is already on the board: the full
+    Eric's rule: do not re-post a name that is already on the board. So the full
     list goes out once when a session's board first forms, and from then on the
-    only messages are names that have newly broken into the top BOARD_N.
+    only messages are names that have newly broken into the top {N}.
     """
     sess = session()
     if sess not in ("pre", "regular", "post"):
@@ -1757,6 +1781,7 @@ def _extended_loop():
             log.error("scan_extended failed: %s", e)
         # Cycle-aware: sleep only the remainder so sweeps land on a steady beat.
         time.sleep(max(10, INTERVAL_EXTENDED - (time.time() - started)))
+
 
 # ----------------------------------------------------------------------
 # ALERT 3: MARKET-WIDE NEWS / CATALYSTS
@@ -1929,7 +1954,12 @@ _ROUNDUP_RE = re.compile(
     r"|stocks?\s+(?:rebound|rally|slip|fall|climb|drop|edge|open|close)"
     r"|dow\s+(?:gains?|falls?|jumps?|drops?|rises?)"
     r"|s&p\s+500|nasdaq\s+composite"
-    r"|what.{0,3}s\s+moving|why\s+these\s+\d+",
+    r"|what.{0,3}s\s+moving|why\s+these\s+\d+"
+    # Auto-generated recaps. Webull emits "Weekly Report: what happened at
+    # MEDS last week" under its own source name, and these name the ticker,
+    # so the subject test alone lets them through.
+    r"|weekly\s+report|monthly\s+report"
+    r"|what\s+happened\s+at\s+\w+\s+(?:last|this)\s+week",
     re.I)
 _HEAD_TICKER_RE = re.compile(r"\b[A-Z]{2,5}\b")
 
@@ -1979,8 +2009,14 @@ def _is_subject(sym, headline, name):
     return bool(hits) and hits[0] in words[:4]
 
 
-def _news_alert(sym, headline, source, url, tag="NEWS"):
-    """Queue a catalyst. Nothing is sent here -- see confirm_catalysts()."""
+def _news_alert(sym, headline, source, url, tag="NEWS", feed=""):
+    """Queue a catalyst. Nothing is sent here -- see confirm_catalysts().
+
+    `feed` is which of our sources found it (alpaca/nasdaq/finnhub/webull/
+    edgar/market), as opposed to `source`, which is the publisher. The daily
+    review reads the CATSRC lines to measure per-source coverage -- which feed
+    is actually earning its place, rather than us guessing after each miss.
+    """
     if too_big(sym):                # fleet-wide market-cap gate
         return False
     if not is_english(headline):    # English-only channel
@@ -1996,6 +2032,8 @@ def _news_alert(sym, headline, source, url, tag="NEWS"):
         if len(_cat_pending) >= CATALYST_MAX_PENDING:
             return False
         _cat_pending[sym] = (now_ts, headline, tag)
+    log.info("CATSRC %s feed=%s publisher=%s", sym, feed or "?",
+             (source or "?")[:40])
     return True
 
 
@@ -2111,7 +2149,8 @@ def check_market_news():
             for sym in list(syms)[:2]:
                 _catalyst.add(sym)
                 if once(nid + ":" + sym):
-                    if _news_alert(sym, headline, str(n.get("source") or ""), url):
+                    if _news_alert(sym, headline, str(n.get("source") or ""),
+                                   url, feed="market"):
                         found += 1
 
     # --- Source B: free PR wires (where small-cap catalysts break first)
@@ -2135,7 +2174,8 @@ def check_market_news():
                     _catalyst.add(sym)
                     key = "pr:" + (entry.get("id") or link or title)[:120] + ":" + sym
                     if once(key):
-                        if _news_alert(sym, title, "PR Wire", link, tag="CATALYST"):
+                        if _news_alert(sym, title, "PR Wire", link,
+                                       tag="CATALYST", feed="prwire"):
                             found += 1
 
     if found:
@@ -2189,11 +2229,6 @@ def _title_tokens(text):
 def _duplicate_story(sym, headline, now_ts):
     """True if this ticker already had this same story in the last 24h.
 
-    One press release reaches us from Finnhub, GlobeNewswire, PRNewswire and
-    EDGAR under four different ids, so id-level de-dup cannot see that they are
-    the same event -- AMCI went out twice for a single story. Compare the words
-    instead: syndicated copies of one story score 0.75-1.00 against each other,
-    while genuinely different stories about the same ticker score about 0.20.
     Callers must already hold _cat_lock.
     """
     toks = _title_tokens(headline)
@@ -2202,7 +2237,7 @@ def _duplicate_story(sym, headline, now_ts):
     keep, dup = [], False
     for ts, prev in _news_titles.get(sym, []):
         if now_ts - ts >= NEWS_WINDOW_SEC:
-            continue                    # older than the throttle window
+            continue
         keep.append((ts, prev))
         union = len(toks | prev)
         if union and (len(toks & prev) / union) >= CATALYST_DUP_SIM:
@@ -2287,7 +2322,7 @@ def poll_edgar():
             name = title.split(" - ", 1)[1] if " - " in title else title
             name = _CIK_RE.sub("", name).replace("(Filer)", "").strip(" -")
             if _news_alert(sym, _sec_headline(form, name), "SEC EDGAR", "",
-                           tag="SEC FILING"):
+                           tag="SEC FILING", feed="edgar"):
                 queued += 1
     if queued:
         log.info("EDGAR: %d filings queued (%d catalysts awaiting confirmation)",
@@ -2366,9 +2401,10 @@ def check_new_listings():
     These have NO prior close, so every percent-change filter in the system is
     blind to them -- yet they are often the wildest premarket names (PSQL ran
     $16.60 to $33.99 on debut). Candidates come from the IPO calendar and from
-    any symbol in the halt feed we have never seen in the universe (new issues
+    any symbol in the halt feed we've never seen in the universe (new issues
     almost always print an IPO1/IPOQ halt at open). The move is measured across
-    the session low-to-last range, since there is nothing else to anchor to.
+    the session's own low-to-last range, since there is nothing else to anchor
+    to.
     """
     sess = session()
     if sess not in ("pre", "regular", "post"):
@@ -2403,7 +2439,7 @@ def check_new_listings():
         if not once("newlist:" + sym + ":" + day + ":" + str(tier)):
             continue
         _catalyst.add(sym)
-        hi = ("  \u2022  High $" + format(q["high"], ",.2f")) if q.get("high") else ""
+        hi = ("  •  High $" + format(q["high"], ",.2f")) if q.get("high") else ""
         send_telegram(
             "\U0001F195 <b>NEW LISTING</b>\n"
             + "<b>" + html.escape(sym) + "</b>  $" + format(price, ",.2f")
@@ -2482,6 +2518,114 @@ def nasdaq_symbol_news(sym):
     return out
 
 
+def _json_object_at(text, start):
+    """Return the balanced {...} literal beginning at index `start`.
+
+    A non-greedy regex cannot do this safely: the blob is ~130KB of JSON with
+    braces inside string values, and there is more JavaScript after it in the
+    same <script>. This walks the text tracking string state and escapes.
+    """
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
+def _webull_slug(sym):
+    """'MEDS' -> 'nasdaq-meds'. Cached, including the unresolvable case."""
+    with _wb_slug_lock:
+        if sym in _wb_slug:
+            return _wb_slug[sym]
+    slug = None
+    try:
+        r = _http.get(WEBULL_SEARCH_URL.format(sym=sym),
+                      headers=WEBULL_HEADERS, timeout=12)
+        if r.status_code != 200:
+            return None             # transient: do NOT cache a failure
+        for row in (r.json() or {}).get("data") or []:
+            got = str(row.get("disSymbol") or row.get("symbol") or "").upper()
+            if got != sym:
+                continue
+            prefix = WEBULL_SLUG_PREFIX.get(
+                str(row.get("disExchangeCode") or "").upper())
+            if prefix:
+                slug = prefix + "-" + sym.lower()
+            break
+    except (requests.RequestException, ValueError, AttributeError) as e:
+        log.debug("Webull slug lookup failed for %s: %s", sym, e)
+        return None
+    with _wb_slug_lock:
+        _wb_slug[sym] = slug
+    return slug
+
+
+def webull_symbol_news(sym):
+    """Per-symbol headlines from Webull's server-rendered quote page.
+
+    Returns the same 5-tuple shape as alpaca_symbol_news. This is the fallback
+    source: see the WEBULL_NEWS_PAGE comment for why it exists.
+    """
+    slug = _webull_slug(sym)
+    if not slug:
+        return []
+    try:
+        r = _http.get(WEBULL_NEWS_PAGE.format(slug=slug),
+                      headers=WEBULL_PAGE_HEADERS, timeout=15)
+        if r.status_code != 200:
+            return []
+        k = r.text.find("window.__initState__")
+        if k < 0:
+            log.debug("Webull news: no __initState__ for %s", sym)
+            return []
+        brace = r.text.find("{", k)
+        raw = _json_object_at(r.text, brace) if brace >= 0 else None
+        if not raw:
+            return []
+        blob = json.loads(raw)
+    except (requests.RequestException, ValueError, AttributeError) as e:
+        log.debug("Webull news failed for %s: %s", sym, e)
+        return []
+    cutoff = time.time() - WEBULL_NEWS_MAX_AGE
+    out = []
+    for tk in (blob.get("tickerMap") or {}).values():
+        if not isinstance(tk, dict):
+            continue
+        for n in (tk.get("newsData") or [])[:12]:
+            title = str(n.get("title") or "").strip()
+            source = str(n.get("sourceName") or "Webull").strip()
+            if not title or source.lower() in WEBULL_NEWS_SKIP_SRC:
+                continue
+            created = str(n.get("newsTime") or "")
+            try:
+                ts = datetime.strptime(created[:19],
+                                       "%Y-%m-%dT%H:%M:%S").timestamp()
+            except (ValueError, TypeError):
+                ts = time.time()
+            if ts < cutoff:
+                continue
+            out.append((created, source, title, str(n.get("newsUrl") or ""),
+                        str(n.get("id") or "")))
+    return out
+
+
 def check_mover_news():
     """Pull catalysts for stocks the scanner has ALREADY flagged as moving.
 
@@ -2528,13 +2672,16 @@ def check_mover_news():
         return
     today = now_et().strftime("%Y-%m-%d")
     found = 0
-    by_src = {"alpaca": 0, "finnhub": 0, "nasdaq": 0}
+    wb_pages = 0
+    by_src = {"alpaca": 0, "finnhub": 0, "nasdaq": 0, "webull": 0}
     for sym in syms:
+        before = found
         # Alpaca first when configured -- it carries Benzinga's wire and was the
         # only source that had the LHSW release.
         for created, src, title, link, aid in alpaca_symbol_news(sym):
             if once("anews:" + sym + ":" + (aid or link or title)[:120]) and \
-                    _news_alert(sym, title, src, link, tag="CATALYST"):
+                    _news_alert(sym, title, src, link, tag="CATALYST",
+                                feed="alpaca"):
                 found += 1
                 by_src["alpaca"] += 1
         # Second opinion: Finnhub's free tier does not carry some micro-caps,
@@ -2543,28 +2690,44 @@ def check_mover_news():
         for created, publisher, title, link in nasdaq_symbol_news(sym):
             nid = "nnews:" + sym + ":" + (link or title)[:120]
             if once(nid) and _news_alert(sym, title, publisher, link,
-                                         tag="CATALYST"):
+                                         tag="CATALYST", feed="nasdaq"):
                 found += 1
                 by_src["nasdaq"] += 1
         items = finnhub_get("company-news",
                             {"symbol": sym, "from": today, "to": today})
-        if not isinstance(items, list):
-            continue
-        for n in items[:3]:
-            url = n.get("url") or ""
-            headline = str(n.get("headline") or "")
-            nid = "mnews:" + sym + ":" + str(n.get("id") or url)
-            if not headline or not once(nid):
-                continue
-            if _news_alert(sym, headline, str(n.get("source") or ""), url,
-                           tag="CATALYST"):
-                found += 1
-                by_src["finnhub"] += 1
-        time.sleep(0.3)             # stay under Finnhub 60 calls/min
-    if found:
+        if isinstance(items, list):
+            for n in items[:3]:
+                url = n.get("url") or ""
+                headline = str(n.get("headline") or "")
+                nid = "mnews:" + sym + ":" + str(n.get("id") or url)
+                if not headline or not once(nid):
+                    continue
+                if _news_alert(sym, headline, str(n.get("source") or ""), url,
+                               tag="CATALYST", feed="finnhub"):
+                    found += 1
+                    by_src["finnhub"] += 1
+        # FALLBACK: none of the three APIs produced a catalyst for a name that
+        # is clearly moving. Webull's quote page carries releases they miss --
+        # it had the MEDS acquisition (Benzinga, 2026-11-19) when Alpaca's own
+        # Benzinga feed returned nothing for the same symbol and window.
+        # Bounded two ways: WEBULL_NEWS_FALLBACK_MAX pages per pass, and at
+        # most one page per symbol per WEBULL_NEWS_PER_SYM_SEC.
+        bucket = int(time.time() // WEBULL_NEWS_PER_SYM_SEC)
+        if (found == before and wb_pages < WEBULL_NEWS_FALLBACK_MAX
+                and once("wbpage:%s:%d" % (sym, bucket))):
+            wb_pages += 1
+            for created, source, title, link, wid in webull_symbol_news(sym):
+                key = "wnews:" + sym + ":" + (wid or link or title)[:120]
+                if once(key) and _news_alert(sym, title, source, link,
+                                             tag="CATALYST", feed="webull"):
+                    found += 1
+                    by_src["webull"] += 1
+        time.sleep(0.3)             # stay under Finnhub's 60 calls/min
+    if found or wb_pages:
         log.info("Mover-news: %d queued across %d flagged names "
-                 "(alpaca=%d finnhub=%d nasdaq=%d)", found, len(syms),
-                 by_src["alpaca"], by_src["finnhub"], by_src["nasdaq"])
+                 "(alpaca=%d finnhub=%d nasdaq=%d webull=%d/%d pages)",
+                 found, len(syms), by_src["alpaca"], by_src["finnhub"],
+                 by_src["nasdaq"], by_src["webull"], wb_pages)
 
 
 # ----------------------------------------------------------------------
